@@ -669,6 +669,8 @@ const vAdd = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]], vSc = (a, k) => [a[0]*
 const vLen = a => Math.hypot(a[0], a[1], a[2]), vLerp = (a, b, t) => [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t];
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const wrap180 = a => ((a + 540) % 360) - 180;
+// frame with origin o, x axis along X and y axis as close to Y as possible (z = x cross y)
+function tFrame(o, X, Y){ const x = norm(X), z = norm(cross(x, Y)), y = cross(z, x); return [x[0], y[0], z[0], o[0], x[1], y[1], z[1], o[1], x[2], y[2], z[2], o[2]]; }
 
 /* ---------- oriented boxes ---------- */
 function obbT(T, lo, hi){ const m = [0,1,2].map(i => (lo[i] + hi[i]) / 2);
@@ -2084,14 +2086,1277 @@ ROBOTS.hexapod = {
 };
 ROBOT_ORDER.push({ id: 'hexapod', name: 'Hexapod walker', blurb: 'Eighteen hobby servos, six 3-DOF legs and a gait engine. Switch tripod, ripple and wave gaits, lean the body, lift a leg and watch the support polygon decide whether it tips.', chips: ['18 servos', 'Leg IK', 'Gaits', 'Stability'] });
 
-/* ---------- the rest of the lineup: spec sheets on the hub, built next ---------- */
-ROBOT_ORDER.push(
-  { id: 'hobbyarm', name: 'Desktop hobby arm', blurb: 'A 5-DOF + gripper arm of serial bus servos on 3D-printed links, the kind used for learning AI teleoperation with a leader arm.', chips: ['5 DOF', 'Bus servos', 'Leader / follower'] },
-  { id: 'delta', name: 'Delta robot', blurb: 'Three motors on a fixed top plate drive three parallelogram arms down to one small platform: extremely fast, always level.', chips: ['3 DOF', 'Parallel', 'Closed chain'] },
-  { id: 'gripper', name: 'Three-finger gripper', blurb: 'Tendon-driven fingers with one motor each, compliant pads and force sensing: how robot hands wrap around odd shapes.', chips: ['Underactuated', 'Tendons', 'Force sensing'] },
-  { id: 'gantry', name: 'CNC gantry / plotter', blurb: 'Steppers, lead screws and timing belts on linear rails: Cartesian motion, microstepping and G-code paths.', chips: ['3 axes', 'Steppers', 'Lead screw + belts'] },
-  { id: 'mobman', name: 'Mobile manipulator', blurb: 'The rover with an arm on top: base and arm coordinate so the gripper reaches what the arm alone cannot.', chips: ['Base + arm', '8 DOF', 'Whole-body'] },
-  { id: 'humanoid', name: 'Humanoid upper body', blurb: 'Two 4-DOF arms, a 2-DOF neck and a camera head on a torso: redundancy, reachability and safe human-like motion.', chips: ['10 DOF', 'Redundant', 'Vision'] });
+/* ============================================================
+   Robot 05 — desktop hobby arm (5 DOF + gripper, serial bus servos, 3D-printed links). 1 unit = 1 cm.
+   Truth: six smart servos on one daisy-chained 3-wire bus (power, ground, half-duplex data). Each servo has its own
+   magnetic encoder (4096 counts per turn), a 345:1 gear train and a small controller that answers "where are you, how
+   hot, how loaded" on the bus. A USB bus adapter and a 7.4 V brick sit on the table. The base yaw servo stands in a
+   printed housing; the shoulder servo rides the turntable; elbow, wrist pitch and wrist roll servos sit at their joints;
+   a sixth servo opens the jaws. A smaller leader arm with the same joints (servos unpowered, read only) is moved by hand;
+   the follower copies its angles every bus cycle: the way teleoperation data for robot learning is collected.
+   Parts: plate, yawS | housing | turn, shS | upper, elS | fore, wpS | wrS | grip | bus, adapter, psu | leader | cube
+   ============================================================ */
+const HA = { BX: 15, BY: 28, Z0: 3, SH: 10, L1: 11.6, L2: 10.4, W: 4.4, G: 6, LK: .62, LX: 48, LY: 36 };
+const HA_LIM = [[-150, 150], [5, 175], [0, 165], [-105, 105], [-180, 180], [0, 1]];
+const HA_VMAX = [160, 120, 140, 200, 280, 2.2];
+const HA_NAMES = ['Base yaw', 'Shoulder', 'Elbow', 'Wrist pitch', 'Wrist roll', 'Gripper'];
+const HA_HOME = [0, 80, 115, 55, 0, .6];
+const HA_CUBE0 = [30, 18];
+const HA_SCALE = k => [k,0,0,0, 0,k,0,0, 0,0,k,0];
+
+function haFK(q, base = tTr(HA.BX, HA.BY, HA.Z0 + HA.SH)){
+  const Ty = tMul(base, tRz(q[0]*DEG)), Tu = tMul(Ty, tRy(-q[1]*DEG)), Te = tCat(Tu, tTr(HA.L1, 0, 0), tRy(q[2]*DEG));
+  const Tw = tCat(Te, tTr(HA.L2, 0, 0), tRy(q[3]*DEG)), Tr = tCat(Tw, tTr(HA.W, 0, 0), tRx(q[4]*DEG));
+  return { Ty, Tu, Te, Tw, Tr, E: tAp(Te, [0,0,0]), W: tAp(Tw, [0,0,0]), tip: tAp(Tr, [HA.G, 0, 0]) }; }
+const haLeadBase = () => tCat(tTr(HA.LX, HA.LY, HA.Z0 + HA.SH*HA.LK), HA_SCALE(HA.LK));
+// tool tip p (follower frame), tool pitch phi (deg from horizontal), elbow up
+function haIK(p, phi, roll, grip){
+  const dx = p[0] - HA.BX, dy = p[1] - HA.BY, r = Math.hypot(dx, dy), yaw = Math.atan2(dy, dx)/DEG, z = p[2] - HA.Z0 - HA.SH, ph = phi*DEG;
+  const wr = r - (HA.W + HA.G)*Math.cos(ph), wz = z - (HA.W + HA.G)*Math.sin(ph), D = Math.hypot(wr, wz);
+  if (D > HA.L1 + HA.L2 - .05) return { err: 'Out of reach: the arm is fully stretched' };
+  if (D < Math.abs(HA.L1 - HA.L2) + 1) return { err: 'Too close to the shoulder' };
+  const a1 = Math.atan2(wz, wr) + Math.acos(clamp((HA.L1**2 + D*D - HA.L2**2) / (2*HA.L1*D), -1, 1));
+  const be = Math.atan2(wz - HA.L1*Math.sin(a1), wr - HA.L1*Math.cos(a1));
+  const q = [yaw, a1/DEG, (a1 - be)/DEG, (be - ph)/DEG, roll, grip];
+  for (let i = 0; i < 5; i++) if (q[i] < HA_LIM[i][0] - 1e-6 || q[i] > HA_LIM[i][1] + 1e-6) return { err: `${HA_NAMES[i]} would pass its limit`, q };
+  return { q }; }
+const haToolPitch = q => q[1] - q[2] - q[3];
+const haGap = g => .5 + g*4.4;
+function haCheck(q){ const F = haFK(q);
+  for (const [nm, p, r] of [['elbow', F.E, 1.8], ['wrist', F.W, 1.6], ['gripper', F.tip, .2], ['gripper', tAp(F.Tr, [1, 0, 0]), 1.6]]){
+    if (p[2] - r < HA.Z0) return { why: `Crash: the ${nm} hit the table`, at: [p[0], p[1], HA.Z0] };
+    if (nm !== 'elbow' && Math.hypot(p[0] - HA.BX, p[1] - HA.BY) < 5 + r && p[2] < HA.Z0 + HA.SH + 2) return { why: 'Self-collision: the gripper hit the base', at: p }; }
+  return null; }
+// gravity torque (N m) at shoulder, elbow, wrist pitch: masses in kg at points along the arm
+function haTorques(q, held){ const F = haFK(q), g = 9.81, S = tAp(F.Tu, [0,0,0]);
+  const M = [[tAp(F.Tu, [HA.L1/2, 0, 0]), .03], [F.E, .055], [tAp(F.Te, [HA.L2/2, 0, 0]), .025], [F.W, .055], [tAp(F.Tw, [HA.W/2, 0, 0]), .055], [tAp(F.Tr, [3, 0, 0]), .07 + (held ? .03 : 0)]];
+  const hz = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]) * Math.sign((b[0] - a[0])*Math.cos(q[0]*DEG) + (b[1] - a[1])*Math.sin(q[0]*DEG) || 1);
+  return [S, F.E, F.W].map((o, j) => Math.abs(M.slice(j*2).reduce((a, [p, m]) => a + m*g*hz(o, p)/100, 0))); }
+
+// one arm: full detail for the follower; the leader uses the same joints, plain printed links and no motors' wiring
+function haArm(st, q, m, lead){
+  const F = haFK(q, lead ? haLeadBase() : undefined), B = lead ? haLeadBase() : tTr(HA.BX, HA.BY, HA.Z0 + HA.SH);
+  const part = n => sbPart(lead ? 'leader' : n), Sv = lead ? matOf('#6f6a63') : SERVO, Lk = lead ? matOf('#efe9da') : m;
+  const servo = (T, lo, hi, ax, c, a0, a1) => { qBox(T, lo, hi, Sv, { w: .8 }); qCyl(T, ax, c, a0, a1, 1.1, HORN, { w: .6 }); };
+  // base: plate, yaw servo, housing
+  part('plate'); qBox(B, [-5, -5, -HA.SH], [5, 5, -HA.SH + .8], Lk, { w: 1 });
+  for (const [x, y] of [[-4, -4], [4, -4], [4, 4], [-4, 4]]) qCyl(B, 'z', [x, y], -HA.SH + .8, -HA.SH + 1.1, .45, STEEL, { w: .4, n: 8 });
+  sbGroup(lead ? 'lhous' : 'hous', B, [-4.2, -4.2, -HA.SH + .8], [4.2, 4.2, -3.6]);
+  part('yawS'); servo(B, [-2, -1.2, -HA.SH + .8], [2, 1.2, -4.3], 'z', [0, 0], -4.3, -3.7);
+  part('housing'); qExt(B, rrUV(-4.2, -4.2, 4.2, 4.2, 2), -HA.SH + .8, -3.6, Lk, { ax: 'z', cover: !lead, w: 1.6,
+    capDeco: b => b && !lead ? txT(B, [0, -2.6, -3.58], [1,0,0], [0,1,0], 'ARM-5', 1.3) : '' });
+  sbFree();
+  // turntable bracket + shoulder servo (axis along local y)
+  part('turn'); qCyl(F.Ty, 'z', [0, 0], -3.6, -3, 3.4, Lk, { w: 1, sh: tone }); for (const y of [-2.6, 2.1]) qBox(F.Ty, [-1.6, y, -3], [1.6, y + .5, .4], Lk, { w: .8, sh: tone });
+  part('shS'); servo(F.Ty, [-1.6, -2.1, -3], [1.8, 2.1, 1.4], 'y', [0, 0], 2.1, 2.5);
+  // upper link + elbow servo
+  part('upper'); qExt(F.Tu, rrUV(-1.5, -1.1, 1.5, 1.1, .6), 1.4, HA.L1 - 1.6, Lk, { w: 1.4 });
+  part('elS'); servo(F.Tu, [HA.L1 - 1.6, -1.6, -1.5], [HA.L1 + 1.6, 1.6, 2.2], 'y', [HA.L1, 0], 1.6, 2);
+  // forearm + wrist pitch servo
+  part('fore'); qExt(F.Te, rrUV(-1.3, -1, 1.3, 1, .5), 1.6, HA.L2 - 1.6, Lk, { w: 1.3 });
+  part('wpS'); servo(F.Te, [HA.L2 - 1.5, -1.4, -1.4], [HA.L2 + 1.5, 1.4, 1.9], 'y', [HA.L2, 0], 1.4, 1.8);
+  // wrist roll servo (axis along local x) and the gripper
+  part('wrS'); servo(F.Tw, [.9, -1.3, -1.3], [HA.W - .4, 1.3, 1.3], 'x', [0, 0], HA.W - .4, HA.W);
+  part('grip'); const gap = haGap(q[5]);
+  qBox(F.Tr, [0, -1.8, -1.1], [.9, 1.8, 1.1], Lk, { w: .8 }); qBox(F.Tr, [.2, -1.1, 1.1], [3.2, 1.1, 2.7], Sv, { w: .7 });
+  for (const s of [1, -1]){ const y0 = s*gap/2, y1 = s*(gap/2 + .45);
+    qBox(F.Tr, [.9, Math.min(y0, y1), -.9], [HA.G + .3, Math.max(y0, y1), .9], lead ? Lk : matOf('#f4b829'), { w: .7 }); }
+  if (lead){ part('leader'); qRod(tAp(F.Tr, [1.4, 0, -1.1]), tAp(F.Tr, [1.4, 0, -3.4]), .55, DARK, { w: .6 }); }
+  return F; }
+
+function haDraw(st, m){
+  const F = haArm(st, st.q, m, false);
+  // bus: daisy chain from the adapter up the arm, servo to servo
+  sbPart('adapter'); qBox(T_I, [3, 6, 3], [9, 10, 3.5], PCB, { w: .7 }); qBox(T_I, [3.2, 7.2, 3.5], [4.6, 8.8, 4.2], STEEL, { w: .5 });
+  sbPart('psu'); qBox(T_I, [3, 13, 3], [10, 17, 5.2], DARK, { w: .9, deco: n => n[2] === 1 ? txT(T_I, [6.5, 15, 5.22], [1,0,0], [0,1,0], '7.4V 5A', 1.1, '#f2efe7') : '' });
+  sbPart('bus'); qWire([[9.5, 15, 4], [11, 12, 3.4], [8.5, 9.2, 3.6]], CABLE.pwr, .3);
+  qWire([[8.8, 8, 3.6], [12, 14, 3.3], [HA.BX - 4.6, HA.BY - 2, 3.4], [HA.BX - 4.4, HA.BY - 1, 7]], '#3a3633', .3);
+  const lp = (T, p) => tAp(T, p);
+  qWire([lp(F.Ty, [-1.8, 0, -2.4]), lp(F.Ty, [-2.4, -2.8, -1]), lp(F.Tu, [3, -1.4, 1.4]), lp(F.Tu, [HA.L1 - 2, -1.6, 1.8])], '#3a3633', .25, { seg: 3 });
+  qWire([lp(F.Tu, [HA.L1 - .6, -1.7, 2]), lp(F.Te, [2.5, -1.2, 1.2]), lp(F.Te, [HA.L2 - 2, -1.4, 1.4])], '#3a3633', .25, { seg: 3 });
+  qWire([lp(F.Te, [HA.L2 - .5, -1.5, 1.6]), lp(F.Tw, [1.2, -1.4, 1.4]), lp(F.Tr, [1.4, -.6, 2.4])], '#3a3633', .25, { seg: 3 });
+  if (partShown(st, ROBOTS.hobbyarm, 'leader')) haArm(st, st.lead, m, true);
+  // cube
+  sbFree(); sbPart('cube'); const c = st.cube, held = st.held, s = 1.25;
+  const Tc = held ? tMul(F.Tr, tTr(HA.G - 1.2, 0, 0)) : tMul(tTr(c[0], c[1], HA.Z0 + c[2] + s), tRz(c[3]));
+  qBox(Tc, [-s, -s, -s], [s, s, s], matOf('#5a82c6'), { w: 1, sh: tone });
+  const pt = boardTop(0, 0, 60, 50, 3, 6); let floor = '', over = '';
+  if (st.mode === 'op'){ if (st.trace) floor += trailSVG(st.trail, '#e2483d', .9, '2 1.4');
+    const L = haFK(st.lead, haLeadBase()); over += tipHandle(L.tip, 3, !!st.crash); if (st.crash) over += crashBurst(st.crash.at, st.crash.t); }
+  return { under: board(0, 0, 60, 50, 3, 6), z0: 3, clip: pt, floor, over };
+}
+
+function haTick(st, dt, ui, lab){
+  let more = false;
+  if (st.play != null){ st.play += dt*30; const i = Math.floor(st.play);
+    if (i >= st.rec.length){ st.play = null; lab.flash('Replay finished'); } else { st.qt = st.rec[i].slice(); more = true; } }
+  else st.qt = st.lead.slice();
+  if (st.recording){ st.recT += dt; more = true;
+    if (st.recT >= 1/30){ st.recT = 0; st.rec.push(st.lead.slice()); if (st.rec.length >= 600){ st.recording = false; lab.flash('Recorder full (20 s)'); } } }
+  const nq = st.q.slice(); let moving = false;
+  for (let i = 0; i < 6; i++){ const d = st.qt[i] - st.q[i]; if (Math.abs(d) > 1e-4){ nq[i] += Math.sign(d)*Math.min(Math.abs(d), HA_VMAX[i]*dt); moving = true; } }
+  if (st.held && nq[5] < st.gripHold) nq[5] = st.gripHold;          // the cube stops the jaws
+  moving = nq.some((v, i) => Math.abs(v - st.q[i]) > 1e-6);
+  if (moving){ const c = haCheck(nq);
+    if (c){ if (!st.crash){ st.crashes++; lab.flash(c.why + ' — follower holds position'); } st.crash = { at: c.at, t: 1 }; }
+    else { st.qd = nq.map((v, i) => (v - st.q[i]) / Math.max(dt, 1e-3)); st.q = nq; const tp = haFK(st.q).tip, l = st.trail[st.trail.length - 1];
+      if (!l || vLen(sub(tp, l)) > .4){ st.trail.push(tp); if (st.trail.length > 300) st.trail.shift(); } } }
+  if (!moving || st.crash) st.qd = [0,0,0,0,0,0];
+  // grasp: closing jaws around the cube take it; opening drops it to the table
+  const F = haFK(st.q), gc = tAp(F.Tr, [HA.G - 1.2, 0, 0]);
+  if (!st.held && st.q[5] < .55 && st.qd[5] < 0 && vLen(sub(gc, [st.cube[0], st.cube[1], HA.Z0 + st.cube[2] + 1.25])) < 1.6){ st.held = true; st.gripHold = (2.5 - .5)/4.4; lab.flash('Cube gripped'); }
+  if (st.held && st.qt[5] > st.gripHold + .05){ st.held = false; st.cube = [gc[0], gc[1], 0, (st.q[0] + 0)*DEG]; lab.flash('Cube released'); }
+  const tq = haTorques(st.q, st.held); st.tq = tq;
+  st.temp = st.temp.map((T, i) => T + dt*((tq[i] || 0)/1.6*30 - (T - 26)*.04));
+  if (st.crash){ st.crash.t -= dt/1.2; if (st.crash.t <= 0) st.crash = null; else more = true; }
+  return more || moving || st.dragging || !!st.crash;
+}
+
+ROBOTS.hobbyarm = {
+  id: 'hobbyarm', fig: '05', name: 'Desktop hobby arm', pal: 'blush', kicker: '5 DOF + gripper · bus servos · leader / follower teleop',
+  blurb: 'A small arm of smart bus servos on 3D-printed links. Move the leader arm by hand and the follower copies it: the way people record demonstrations to teach robots new skills.',
+  size: [60, 50, 34], center: [30, 25], bounds: [4, 56, 4, 46, 0, 32],
+  init: () => ({ q: HA_HOME.slice(), qt: HA_HOME.slice(), lead: HA_HOME.slice(), qd: [0,0,0,0,0,0], tq: [0,0,0], temp: [26, 26, 26], trail: [], trace: true, crash: null, crashes: 0,
+    cube: [HA_CUBE0[0], HA_CUBE0[1], 0, 0], held: false, gripHold: 0, rec: [], recording: false, recT: 0, play: null }),
+  thumbYaw: 0,
+  steps: [
+    { title: 'Base plate & yaw servo', parts: ['plate', 'yawS'], text: 'A printed plate is clamped to the desk. The base servo stands in it with its output horn facing up: it turns the whole arm.' },
+    { title: 'Base housing', parts: ['housing'], text: 'A printed shell closes over the yaw servo. See-through keeps it in view.' },
+    { title: 'Turntable & shoulder servo', parts: ['turn', 'shS'], text: 'A bracket on the yaw horn carries the shoulder servo with its shaft horizontal. The shoulder works hardest: it lifts everything beyond it.' },
+    { title: 'Upper arm & elbow servo', parts: ['upper', 'elS'], text: 'The 116 mm printed upper arm bolts to the shoulder horn and holds the elbow servo at its tip.' },
+    { title: 'Forearm & wrist pitch servo', parts: ['fore', 'wpS'], text: 'The forearm (104 mm) ends in the wrist pitch servo, which keeps the gripper pointing where you want while the arm moves.' },
+    { title: 'Wrist roll servo', parts: ['wrS'], text: 'Its shaft points along the forearm, so it spins the gripper about its own axis.' },
+    { title: 'Gripper', parts: ['grip'], text: 'A sixth servo drives a rack between two jaws. Its load reading tells you how hard it is squeezing.' },
+    { title: 'Bus cable, adapter & power', parts: ['bus', 'adapter', 'psu'], text: 'One 3-wire cable hops servo to servo: power, ground and a shared data line. Each servo has an ID (1 to 6); the USB adapter asks each in turn for its position, load and temperature.' },
+    { title: 'Leader arm', parts: ['leader'], text: 'A smaller copy with the same joints. Its servos are left unpowered and only read their encoders, so a person can move it freely by hand.' },
+    { title: 'Test cube', parts: ['cube'], text: 'Something to pick. In Operate, drag the leader’s ring, close the gripper on the cube and record the motion.' },
+  ],
+  parts: {
+    plate: { name: 'Base plate', kind: 'structure', short: 'printed, clamped to the desk', info: 'Spreads the reaction forces of a moving arm into the desk. A light arm that is not clamped tips over when it reaches out.', held: 'Desk clamps' },
+    yawS: { name: 'Base yaw servo (ID 1)', kind: 'motor', lbl: 'YAW SERVO', inside: true, short: 'bus servo, 4096-count encoder', info: 'Inside every bus servo: a coreless DC motor, a 345:1 metal gear train, a 12-bit magnetic encoder on the output and a controller running a position loop.', held: 'The base plate', spec: '1.6 N m stall at 7.4 V' },
+    housing: { name: 'Base housing', kind: 'cover', lbl: 'BASE', key: true, short: 'printed shell', info: 'PLA, 2 mm walls. Printed links are light and cheap; their weakness is creep under a constant load.', held: 'Screws into the plate' },
+    turn: { name: 'Turntable bracket', kind: 'structure', short: 'yaw horn to shoulder', info: 'Two printed cheeks either side of the shoulder servo.', held: 'The yaw servo horn' },
+    shS: { name: 'Shoulder servo (ID 2)', kind: 'motor', lbl: 'SHOULDER', key: true, short: 'carries the most load', info: 'Gravity torque here = weight × horizontal reach. Stretch the arm out flat and watch its load bar climb toward stall.', held: 'The turntable bracket' },
+    upper: { name: 'Upper arm', kind: 'structure', lbl: 'UPPER ARM', key: true, short: '116 mm printed link', info: 'Hollow, ribbed and printed in one piece.', held: 'The shoulder servo horn', spec: 'L1 = 116 mm' },
+    elS: { name: 'Elbow servo (ID 3)', kind: 'motor', lbl: 'ELBOW', short: 'bus servo', info: 'Its own weight sits at the tip of the upper arm, so it adds to the shoulder load.', held: 'The tip of the upper arm' },
+    fore: { name: 'Forearm', kind: 'structure', lbl: 'FOREARM', short: '104 mm printed link', info: 'Shorter and lighter than the upper arm: weight far out costs the most torque.', held: 'The elbow servo horn', spec: 'L2 = 104 mm' },
+    wpS: { name: 'Wrist pitch servo (ID 4)', kind: 'motor', lbl: 'WRIST PITCH', short: 'keeps the tool angle', info: 'Shoulder + elbow + wrist pitch together decide the gripper angle: pitch = q2 − q3 − q4.', held: 'The tip of the forearm' },
+    wrS: { name: 'Wrist roll servo (ID 5)', kind: 'motor', lbl: 'WRIST ROLL', short: 'spins the gripper', info: 'Turns the jaws to line up with an object’s edges.', held: 'The wrist pitch horn' },
+    grip: { name: 'Gripper (ID 6)', kind: 'tool', lbl: 'GRIPPER', key: true, short: 'two jaws, 0–49 mm', info: 'The jaw servo is position controlled. When a jaw meets the cube it stalls short of its target, and the load reading rises: the simplest grip-force sensor there is.', held: 'The wrist roll horn' },
+    bus: { name: 'Servo bus cable', kind: 'wiring', lbl: 'BUS', inside: true, short: 'daisy chain, 1 Mbit/s', info: 'Half-duplex serial: the adapter talks, then listens. At 1 Mbit/s it can read and write all six servos a few hundred times a second.', held: 'Clips on each servo' },
+    adapter: { name: 'USB bus adapter', kind: 'electronics', lbl: 'BUS ADAPTER', short: 'USB to servo bus', info: 'Turns the computer’s USB serial into the servo bus and injects power from the brick.', held: 'The desk' },
+    psu: { name: 'Power brick', kind: 'power', lbl: '7.4 V SUPPLY', short: '7.4 V, 5 A', info: 'Six stalled servos can pull over 10 A, so the supply sets a real limit on how hard the arm can push.', held: 'The desk' },
+    leader: { shadow: 'leader', name: 'Leader arm', kind: 'tool', lbl: 'LEADER ARM', key: true, short: 'hand-moved, read only', info: 'Same joint layout at a smaller scale, so joint angles copy straight across with no inverse kinematics. Drag its yellow ring to move it.', held: 'Its own base plate' },
+    cube: { shadow: 'cube', name: 'Test cube', kind: 'tool', short: '25 mm, 20 g', info: 'Close the gripper with the jaws either side of it to pick it.', held: 'The desk' },
+  },
+  concepts: [
+    ['Bus servos', 'Hobby servos used to take one PWM signal each and report nothing. Bus servos share one cable, have IDs and send back position, speed, load, voltage and temperature: a robot arm that can feel.'],
+    ['Leader / follower teleoperation', 'The human moves the leader; every bus cycle its joint angles become the follower’s targets. Because both arms have identical joints, no inverse kinematics is needed. The follower lags when its speed limit is reached: see Tracking error.'],
+    ['Recording demonstrations', 'Press Record and move the leader: each frame stores the joint angles (30 per second). Replay runs the follower from the recording alone. A learned policy does the same job, predicting the next angles from camera images instead of replaying.'],
+    ['Gravity load', 'Torque = mass × g × horizontal distance. With the arm folded up the shoulder is nearly unloaded; stretched out flat it works hardest. Printed-arm servos are close to their stall torque, which is why these arms carry only a few hundred grams.'],
+    ['Heat', 'A servo holding a load draws current all the time and warms up. Hobby servos cut out around 70 °C; keep the arm folded when idle.'],
+  ],
+  draw: haDraw,
+  active: st => { const a = {}, nm = ['yawS', 'shS', 'elS', 'wpS', 'wrS', 'grip']; (st.qd || []).forEach((v, i) => { if (Math.abs(v) > .5) a[nm[i]] = true; }); if (st.recording) a.leader = true; return a; },
+  enterOp: st => { st.qt = st.q.slice(); },
+  opHTML: () => `<div class="row2"><button id="harec">Record</button><button id="haplay">Replay</button><button id="hahome">Home</button><button id="hacube">Reset cube</button></div>
+    <div class="row2"><button id="haopen">Open gripper</button><button id="haclose">Close gripper</button></div>
+    <p class="note">Drag the yellow ring on the leader arm (right): the follower copies its joints. Sliders move the leader too.</p>
+    ${HA_NAMES.map((n, i) => slHTML('ha' + i, n, i === 5 ? 0 : HA_LIM[i][0], i === 5 ? 100 : HA_LIM[i][1], 1, i === 5 ? '%' : '°')).join('')}
+    <div class="row2"><button id="hatr" aria-pressed="true">Trace</button><button id="haclr">Clear trace</button></div>`,
+  opBind(el, st, ui, lab){ const $ = id => document.getElementById(id);
+    const stopPlay = () => { if (st.play != null){ st.play = null; lab.flash('Replay stopped: the leader has control'); } };
+    for (let i = 0; i < 6; i++) $('s_ha' + i).oninput = e => { stopPlay(); st.lead[i] = i === 5 ? +e.target.value/100 : +e.target.value; lab.kick(); };
+    $('haopen').onclick = () => { stopPlay(); st.lead[5] = 1; lab.kick(); }; $('haclose').onclick = () => { stopPlay(); st.lead[5] = 0; lab.kick(); };
+    $('harec').onclick = () => { if (st.recording){ st.recording = false; lab.flash(`Recorded ${(st.rec.length/30).toFixed(1)} s (${st.rec.length} frames)`); }
+      else { stopPlay(); st.rec = []; st.recording = true; lab.flash('Recording: move the leader arm'); } lab.kick(); ui.render(); };
+    $('haplay').onclick = () => { if (!st.rec.length) return lab.flash('Record something first');
+      st.recording = false; st.play = 0; lab.flash('Replaying: the follower runs from the recording, the leader is ignored'); lab.kick(); ui.render(); };
+    $('hahome').onclick = () => { stopPlay(); st.lead = HA_HOME.slice(); lab.kick(); };
+    $('hacube').onclick = () => { st.held = false; st.cube = [HA_CUBE0[0], HA_CUBE0[1], 0, 0]; ui.render(); };
+    $('hatr').onclick = () => { st.trace = !st.trace; ui.render(); }; $('haclr').onclick = () => { st.trail = []; ui.render(); }; },
+  opSync(el, st){ const $ = id => document.getElementById(id);
+    for (let i = 0; i < 6; i++) slSync('ha' + i, i === 5 ? st.lead[5]*100 : st.lead[i], i === 5 ? `${(haGap(st.lead[5])*10).toFixed(0)} mm` : `${st.lead[i].toFixed(0)}°`, i < 5 && (Math.abs(st.lead[i] - HA_LIM[i][0]) < .5 || Math.abs(st.lead[i] - HA_LIM[i][1]) < .5));
+    $('harec').textContent = st.recording ? `Stop (${(st.rec.length/30).toFixed(1)} s)` : 'Record'; $('harec').setAttribute('aria-pressed', st.recording);
+    $('haplay').setAttribute('aria-pressed', st.play != null); $('hatr').setAttribute('aria-pressed', st.trace); },
+  readout(st){ const tick = a => Math.round(2048 + a/360*4096), err = Math.max(...st.q.slice(0, 5).map((v, i) => Math.abs(v - st.qt[i]))), rows = [];
+    HA_NAMES.slice(0, 5).forEach((n, i) => rows.push({ k: `${n} ${st.q[i].toFixed(0)}°`, bar: i >= 1 && i <= 3 ? st.tq[i - 1]/1.6 : Math.abs(st.qd[i])/HA_VMAX[i], v: i >= 1 && i <= 3 ? `${(st.tq[i - 1]/1.6*100).toFixed(0)}% load` : `${tick(st.q[i])}`, warn: i >= 1 && i <= 3 && st.tq[i - 1] > 1.2, tip: i >= 1 && i <= 3 ? 'Gravity torque / 1.6 N m stall' : 'Encoder count (0–4095)' }));
+    rows.push({ k: 'Jaw gap', v: `${(haGap(st.q[5])*10).toFixed(0)} mm${st.held ? ' · holding' : ''}` });
+    rows.push({ k: 'Tracking error', bar: err/30, v: `${err.toFixed(1)}°`, warn: err > 15, tip: 'Largest gap between leader and follower joints' });
+    rows.push({ k: 'Shoulder temp', bar: (st.temp[0] - 20)/50, v: `${st.temp[0].toFixed(1)} °C`, warn: st.temp[0] > 55 });
+    rows.push({ k: 'Recording', v: st.recording ? `REC ${(st.rec.length/30).toFixed(1)} s` : st.play != null ? `replay ${(st.play/30).toFixed(1)} / ${(st.rec.length/30).toFixed(1)} s` : st.rec.length ? `${(st.rec.length/30).toFixed(1)} s stored` : '—' });
+    rows.push({ k: 'Crashes', v: `${st.crashes}`, warn: !!st.crash });
+    return rows; },
+  stats: st => { const t = haFK(st.q).tip; return [{ label: 'Tip X Y Z mm', value: `${Math.round((t[0]-HA.BX)*10)} ${Math.round((t[1]-HA.BY)*10)} ${Math.round((t[2]-HA.Z0)*10)}`, small: true }]; },
+  tick: haTick,
+  onDrag(st, dx, dy, phase, lab){
+    if (phase === 'start'){ st.play = null; st.dragP = haFK(st.lead).tip; return; } if (phase !== 'move') return;
+    const d = vSc(dragWorld(dx, dy), 1/HA.LK), p = vAdd(st.dragP, d), ph0 = haToolPitch(st.lead);
+    // keep the gripper angle if possible; otherwise tilt it as little as needed to stay inside the joint limits
+    let r = haIK(p, ph0, st.lead[4], st.lead[5]);
+    for (let k = 1; r.err && k <= 12; k++) for (const sg of [1, -1]){ const r2 = haIK(p, ph0 + sg*k*8, st.lead[4], st.lead[5]); if (!r2.err){ r = r2; break; } }
+    if (r.err) return lab.flash(r.err); st.dragP = p; st.lead = r.q; },
+  params(st, q){ if (q.has('q')){ const v = q.get('q').split(',').map(Number); if (v.length === 6){ st.q = v.slice(); st.qt = v.slice(); st.lead = v.slice(); } } },
+};
+ROBOT_ORDER.push({ id: 'hobbyarm', name: 'Desktop hobby arm', blurb: 'A 5-DOF + gripper arm of serial bus servos on 3D-printed links. Move the leader arm, the follower copies it; record a demonstration and replay it.', chips: ['5 DOF', 'Bus servos', 'Leader / follower'] });
+
+/* ============================================================
+   Robot 06 — delta picker (three-arm parallel robot, ~36 cm working circle). 1 unit = 1 cm.
+   Truth: a stiff frame holds a top plate. Under it, in a sealed drive housing, three servo motors with planetary
+   gearboxes sit 120 degrees apart, each turning one short, stiff upper arm. From each arm's elbow two thin carbon rods run
+   down to the small moving platform; the rods end in ball joints held together by springs. Each pair of rods is a
+   parallelogram, so the platform can only translate: it stays level whatever the arms do. All three motors share the
+   load, and the moving parts are very light: that is how deltas reach 3–5 picks per second.
+   Parts: frame | housing, motors, gearboxes | arms | balls | rods, springs | plate | cup, vac | pads, pucks
+   ============================================================ */
+const DL = { C: 30, R: 8, RF: 13, RE: 34, r: 4.2, ZM: 46, ZT: 52, W: 2, CUP: 2.6, ZMIN: 6, ZMAX: 21, RMAX: 16, VMAX: 400, AMAX: 6000 };
+const DL_PHI = [90, 210, 330].map(a => a*DEG);
+const DL_LIM = [-50, 95];
+const DL_A = [18, 30], DL_B = [42, 30], DL_PAD = 4, DL_PUCK = 1.1, DL_UP = 3.5;
+const dlU = i => [Math.cos(DL_PHI[i]), Math.sin(DL_PHI[i]), 0], dlT = i => [-Math.sin(DL_PHI[i]), Math.cos(DL_PHI[i]), 0];
+const dlM = i => [DL.C + DL.R*Math.cos(DL_PHI[i]), DL.C + DL.R*Math.sin(DL_PHI[i]), DL.ZM];
+
+// inverse kinematics: platform centre P -> three arm angles (deg, positive = down); null if any arm cannot reach
+function dlIK(P){ const th = [];
+  for (let i = 0; i < 3; i++){ const u = dlU(i), t = dlT(i), d = [P[0] - DL.C, P[1] - DL.C];
+    const a = d[0]*u[0] + d[1]*u[1] + DL.r - DL.R, y0 = d[0]*t[0] + d[1]*t[1], z = P[2] - DL.ZM;
+    const A = -2*a*DL.RF, B = 2*z*DL.RF, K = DL.RE**2 - DL.RF**2 - a*a - y0*y0 - z*z, h = Math.hypot(A, B);
+    if (Math.abs(K) > h) return { err: 'Out of reach: a rod pair cannot stretch that far' };
+    const base = Math.atan2(B, A), dd = Math.acos(K/h), s1 = base + dd, s2 = base - dd, s = Math.cos(s1) > Math.cos(s2) ? s1 : s2;
+    const deg = wrap180(s/DEG); if (deg < DL_LIM[0] || deg > DL_LIM[1]) return { err: `Arm ${i + 1} would pass its limit` }; th.push(deg); }
+  return { th }; }
+const dlElbow = (i, th) => vAdd(dlM(i), vAdd(vSc(dlU(i), DL.RF*Math.cos(th*DEG)), [0, 0, -DL.RF*Math.sin(th*DEG)]));
+function dlClamp(P){ const d = [P[0] - DL.C, P[1] - DL.C], r = Math.hypot(d[0], d[1]), k = r > DL.RMAX ? DL.RMAX/r : 1;
+  return [DL.C + d[0]*k, DL.C + d[1]*k, clamp(P[2], DL.ZMIN, DL.ZMAX)]; }
+const dlStackTop = n => DL_PAD + n*DL_PUCK;
+const DL_PUCKC = ['#e2483d', '#5a82c6', '#43c25c', '#f4b829', '#d8869c'];
+
+function dlDraw(st, m){
+  const P = st.P, th = st.th, C = DL.C;
+  // ---- frame: three columns, top beams, top plate
+  sbPart('frame'); for (const a of [30, 150, 270].map(a => a*DEG)){ const x = C + 25*Math.cos(a), y = C + 25*Math.sin(a);
+    qBox(T_I, [x - 1.1, y - 1.1, 3], [x + 1.1, y + 1.1, DL.ZT + 1.4], ALU, { w: 1 });
+    qBox(T_I, [x - 2.2, y - 2.2, 3], [x + 2.2, y + 2.2, 3.6], STEEL, { w: .7 });
+    qRod([x, y, DL.ZT + .7], [C + 13*Math.cos(a), C + 13*Math.sin(a), DL.ZT + .7], .9, ALU, { w: .9 }); }
+  qExt(T_I, ellUV(C, C, 16, 16, 6), DL.ZT, DL.ZT + 1.4, ALU, { ax: 'z', w: 1.6 });
+  // ---- drive housing: motors, gearboxes and encoders (shaft along the arm's tangent)
+  sbGroup('drive', T_I, [C - 15, C - 15, DL.ZM - 3.4], [C + 15, C + 15, DL.ZT]);
+  for (let i = 0; i < 3; i++){ const M = dlM(i), t = dlT(i);
+    sbPart('gearboxes'); qRod(vAdd(M, vSc(t, -1.5)), vAdd(M, vSc(t, -4.4)), 2.3, REDUCER, { w: .9 });
+    sbPart('motors'); qRod(vAdd(M, vSc(t, -4.4)), vAdd(M, vSc(t, -9.6)), 1.9, MOTOR, { w: .9 });
+    sbPart('encoders'); qRod(vAdd(M, vSc(t, -9.6)), vAdd(M, vSc(t, -10.6)), 1.6, DARK, { w: .7 });
+    sbPart('motors'); qBox(T_I, [M[0] - .8, M[1] - .8, DL.ZM + 2], [M[0] + .8, M[1] + .8, DL.ZT], ALU, { w: .6 }); }
+  sbPart('housing'); qExt(T_I, ellUV(C, C, 14.6, 14.6, 30), DL.ZM - 3.4, DL.ZT, m, { ax: 'z', cover: true, w: 2,
+    capDeco: () => '' });
+  sbFree(); if (facing([0, -1, 0])) sbPut(txT(T_I, [C, C - 14.7, DL.ZM], [1,0,0], [0,0,1], 'DELTA-3', 2.6), obbW([C - 6, C - 14.8, DL.ZM - 1], [C + 6, C - 14.6, DL.ZM + 1]), { p: 'housing' });
+  // ---- arms, elbow crossbars + balls, rod pairs with springs
+  const pl = (i, s) => vAdd(vAdd(P, vSc(dlU(i), DL.r)), vSc(dlT(i), s*DL.W));
+  for (let i = 0; i < 3; i++){ const M = dlM(i), t = dlT(i), J = dlElbow(i, th[i]);
+    sbPart('arms'); qRod(vAdd(M, vSc(t, -1.5)), vAdd(M, vSc(t, 1.5)), 1.6, STEEL, { w: .8 });
+    qRod(M, J, 1, m, { r1: .7, sh: tone, w: 1.1 });
+    qRod(vAdd(J, vSc(t, -DL.W)), vAdd(J, vSc(t, DL.W)), .45, STEEL, { w: .6 });
+    for (const s of [-1, 1]){ const a = vAdd(J, vSc(t, s*DL.W)), b = pl(i, s);
+      sbPart('balls'); qBall(a, .55, STEEL); qBall(b, .5, STEEL);
+      sbPart('rods'); qRod(vLerp(a, b, .03), vLerp(b, a, .03), .32, DARK, { w: .7 }); }
+    sbPart('springs'); const a = vAdd(J, vSc(t, -DL.W)), b = pl(i, -1), c = vAdd(J, vSc(t, DL.W)), d = pl(i, 1);
+    for (const k of [.12, .88]) qHelix(vLerp(a, b, k), vLerp(c, d, k), .22, 7, '#c6ccce', { w: .5 }); }
+  // ---- platform, cup, vacuum line
+  sbPart('plate'); qExt(T_I, ellUV(P[0], P[1], 5.4, 5.4, 6), P[2] - .45, P[2] + .45, m, { ax: 'z', w: 1.3, sh: tone });
+  for (let i = 0; i < 3; i++) qRod(pl(i, -1), pl(i, 1), .3, STEEL, { w: .5 });
+  sbPart('cup'); qRod([P[0], P[1], P[2] - .45], [P[0], P[1], P[2] - 1.6], .7, DARK, { w: .7 }); qRod([P[0], P[1], P[2] - 1.6], [P[0], P[1], P[2] - DL.CUP], .6, RUBBER, { r1: 1.4, w: .8 });
+  sbPart('vac'); qWire([[P[0] + .6, P[1], P[2] - .9], [P[0] + 2, P[1] + 1, P[2] + 4], [P[0]*.5 + C*.5 + 3, P[1]*.5 + C*.5, (P[2] + DL.ZM)/2 + 4], [C + 4, C + 3, DL.ZM - 3.4]], st.vac ? '#8af0ae' : CABLE.air, .3, { seg: 6 });
+  // ---- pick pads and pucks
+  sbPart('pads'); for (const [x, y] of [DL_A, DL_B]) qBox(T_I, [x - 3.2, y - 3.2, 3], [x + 3.2, y + 3.2, DL_PAD], matOf('#9db2cc'), { w: .9 });
+  sbPart('pucks'); let k = 0;
+  for (const [key, c] of [['A', DL_A], ['B', DL_B]]) for (let j = 0; j < st.stack[key]; j++){ const z = dlStackTop(j);
+    qRod([c[0], c[1], z], [c[0], c[1], z + DL_PUCK - .05], 2.3, matOf(DL_PUCKC[(k++) % 5]), { w: .9, sh: tone, p: 'pucks' }); }
+  if (st.held) qRod([P[0], P[1], P[2] - DL.CUP - DL_PUCK + .05], [P[0], P[1], P[2] - DL.CUP], 2.3, matOf('#f2efe7'), { w: .9, sh: tone });
+  const pt = boardTop(0, 0, 60, 60, 3, 6); let floor = '', over = '';
+  if (st.mode === 'op'){ floor += `<path d="${pd(on(PZ(3.02), ellUV(C, C, DL.RMAX, DL.RMAX, 48)))}" fill="none" stroke="#3d5878" stroke-width=".7" stroke-dasharray="1.6 1.2"/>`;
+    if (st.trace) over += trailSVG(st.trail, '#e2483d', .9);
+    over += tipHandle([P[0], P[1], P[2] - DL.CUP], 3, !!st.crash); if (st.crash) over += crashBurst(st.crash.at, st.crash.t); }
+  return { under: board(0, 0, 60, 60, 3, 6), z0: 3, clip: pt, floor, over };
+}
+
+// a pick & place cycle: the classic "adept" path, up, across, down
+function dlCycle(st, lab){
+  const from = st.stack.A > 0 ? 'A' : 'B'; if (!st.stack[from]) return lab.flash('No parts to move');
+  const to = from === 'A' ? 'B' : 'A', fc = from === 'A' ? DL_A : DL_B, tc = to === 'A' ? DL_A : DL_B;
+  if (from !== st.dir){ st.dir = from; }
+  const pz = dlStackTop(st.stack[from]) + DL.CUP, dz = dlStackTop(st.stack[to]) + DL_PUCK + DL.CUP, hi = Math.max(pz, dz) + DL_UP;
+  st.prog = [{ p: [fc[0], fc[1], hi] }, { p: [fc[0], fc[1], pz], vac: true }, { p: [fc[0], fc[1], hi] }, { p: [tc[0], tc[1], hi] }, { p: [tc[0], tc[1], dz], vac: false }, { p: [tc[0], tc[1], hi] }];
+  st.cycle = 0; }
+function dlTick(st, dt, ui, lab){
+  let moving = false;
+  if (!st.prog.length && st.run && !st.dragging) dlCycle(st, lab);
+  const goal = st.prog.length ? st.prog[0].p : st.goal;
+  if (goal){ const d = sub(goal, st.P), L = vLen(d), vmax = DL.VMAX*st.speed, amax = DL.AMAX*st.speed*st.speed;
+    if (L > 1e-3){ const vstop = Math.sqrt(2*amax*L); const v = Math.min(vmax, st.vel + amax*dt, vstop); const stepL = Math.min(L, v*dt);
+      const np = vAdd(st.P, vSc(d, stepL/L)), r = dlIK(np), hit = dlHit(st, np);
+      if (hit){ st.prog = []; st.goal = null; st.run = false; st.vel = 0; st.crash = { at: hit.at, t: 1 }; st.crashes++; lab.flash(hit.why + ' — motion stopped'); }
+      else if (r.err){ st.prog = []; st.goal = null; st.run = false; st.vel = 0; lab.flash(r.err); }
+      else { st.acc = (v - st.vel)/Math.max(dt, 1e-3); st.thd = r.th.map((a, i) => (a - st.th[i])/Math.max(dt, 1e-3)); st.th = r.th; st.P = np; st.vel = v; moving = true;
+        const l = st.trail[st.trail.length - 1], tp = [np[0], np[1], np[2] - DL.CUP]; if (!l || vLen(sub(tp, l)) > .4){ st.trail.push(tp); if (st.trail.length > 260) st.trail.shift(); } } }
+    else { st.vel = 0; st.P = goal.slice();
+      if (st.prog.length){ const s = st.prog.shift(); if (s.vac != null) dlVac(st, s.vac, lab); moving = true;
+        if (!st.prog.length){ st.cycles++; st.lastCycle = st.cycle; } }
+      else st.goal = null; } }
+  if (!moving){ st.thd = [0, 0, 0]; st.acc = 0; }
+  if (st.prog.length) st.cycle += dt;
+  if (st.crash){ st.crash.t -= dt/1.2; if (st.crash.t <= 0) st.crash = null; else moving = true; }
+  return moving || st.run || st.dragging || !!st.crash;
+}
+function dlVac(st, on, lab){ st.vac = on; const P = st.P;
+  const at = Math.hypot(P[0] - DL_A[0], P[1] - DL_A[1]) < 1.5 ? 'A' : Math.hypot(P[0] - DL_B[0], P[1] - DL_B[1]) < 1.5 ? 'B' : null;
+  if (on && !st.held && at && st.stack[at] && Math.abs(P[2] - DL.CUP - dlStackTop(st.stack[at])) < .5){ st.stack[at]--; st.held = true; }
+  else if (on && !st.held) lab.flash('Vacuum on — nothing under the cup');
+  if (!on && st.held){ st.held = false; if (at) st.stack[at]++; else lab.flash('Part dropped off the pads'); } }
+function dlHit(st, P){ const cz = P[2] - DL.CUP - (st.held ? DL_PUCK : 0);
+  for (const [key, c] of [['A', DL_A], ['B', DL_B]]) if (Math.abs(P[0] - c[0]) < 3.2 + 1.4 && Math.abs(P[1] - c[1]) < 3.2 + 1.4 && cz < dlStackTop(st.stack[key]) - .05) return { why: `Crash: the cup pressed into pad ${key}`, at: [P[0], P[1], dlStackTop(st.stack[key])] };
+  if (cz < 3) return { why: 'Crash: the cup hit the table', at: [P[0], P[1], 3] };
+  return null; }
+
+const DL_HOME = [30, 30, 18];
+ROBOTS.delta = {
+  id: 'delta', fig: '06', name: 'Delta picker', pal: 'mustard', kicker: '3 DOF parallel · closed chain · platform always level',
+  blurb: 'Three motors on a fixed plate swing three short arms; pairs of thin rods carry a tiny platform that can only slide, never tilt. Everything that moves is light, so it picks parts several times a second.',
+  size: [60, 60, 62], center: [30, 30], bounds: [4, 56, 4, 56, 0, 60],
+  init: () => { const r = dlIK(DL_HOME); return { P: DL_HOME.slice(), th: r.th, thd: [0, 0, 0], vel: 0, acc: 0, goal: null, prog: [], run: false, speed: .25, vac: false, held: false,
+    stack: { A: 5, B: 0 }, dir: 'A', cycle: 0, cycles: 0, lastCycle: 0, trail: [], trace: true, crash: null, crashes: 0 }; },
+  thumbYaw: 0,
+  steps: [
+    { title: 'Frame & top plate', parts: ['frame'], text: 'Three aluminium columns hold a stiff hexagonal plate. Everything else hangs from it, so it must not flex: any wobble shows at the platform.' },
+    { title: 'Motors, gearboxes, encoders', parts: ['motors', 'gearboxes', 'encoders'], peek: true, text: 'Three servo motors hang under the plate 120 degrees apart, each through a planetary gearbox. Their shafts run sideways (tangent to the circle) so each arm swings in its own vertical plane.' },
+    { title: 'Drive housing', parts: ['housing'], text: 'A sealed cover keeps the drives clean: deltas often work over food.' },
+    { title: 'Upper arms', parts: ['arms'], text: 'Short, stiff arms (120 mm) clamp onto the gearbox outputs. Each ends in a crossbar for the two rod ends.' },
+    { title: 'Ball joints', parts: ['balls'], text: 'Steel balls on the crossbars and on the platform. The rod ends are cups that snap over them.' },
+    { title: 'Parallelogram rods & springs', parts: ['rods', 'springs'], text: 'Two carbon rods per arm, 300 mm long, kept parallel and equal: a parallelogram. Springs pull each pair of cups onto its balls.' },
+    { title: 'Moving platform', parts: ['plate'], text: 'The small platform hangs on the six rod ends. Because each rod pair is a parallelogram it can move in X, Y and Z but never tilt.' },
+    { title: 'Vacuum cup & line', parts: ['cup', 'vac'], text: 'A suction cup under the platform and a light hose up to the plate.' },
+    { title: 'Pads & parts', parts: ['pads', 'pucks'], text: 'Five parts stacked on pad A. In Operate, press Run to move them to pad B and back.' },
+  ],
+  parts: {
+    frame: { name: 'Frame & top plate', kind: 'structure', lbl: 'FRAME', key: true, short: 'three columns + plate', info: 'The robot pushes against its own frame at every acceleration. A delta at 10 g needs a frame as stiff as a machine tool.', held: 'Bolted to the table' },
+    motors: { name: 'Servo motors (×3)', kind: 'motor', lbl: 'SERVO MOTORS', inside: true, short: '750 W AC servos', info: 'Each motor turns one arm. They never move: the heaviest parts of the robot stay still, which is the whole trick of a parallel robot.', held: 'Brackets under the top plate' },
+    gearboxes: { name: 'Planetary gearboxes', kind: 'gear', lbl: 'GEARBOXES', inside: true, short: '15:1, low backlash', info: 'A low ratio keeps the arms fast; the motors run at up to 3000 rpm, the arms at 200 rpm.', held: 'The motor flanges', spec: '15:1' },
+    encoders: { name: 'Motor encoders', kind: 'sensor', lbl: 'ENCODERS', inside: true, short: '20-bit absolute', info: 'The controller knows only the three arm angles; the platform position comes from the forward kinematics.', held: 'The back of each motor' },
+    housing: { name: 'Drive housing', kind: 'cover', lbl: 'DRIVE HOUSING', key: true, short: 'washdown cover', info: 'Sealed and smooth so it can be cleaned.', held: 'Under the top plate' },
+    arms: { name: 'Upper arms', kind: 'structure', lbl: 'UPPER ARMS', key: true, short: '120 mm, stiff', info: 'The only links the motors swing directly. Arm angle 0 is horizontal; positive is down.', held: 'The gearbox output shafts', spec: 'rf = 120 mm' },
+    balls: { name: 'Ball joints', kind: 'structure', lbl: 'BALL JOINTS', short: '12 ball-and-cup joints', info: 'Each ball joint is 3 rotational DOF with no backlash because the springs preload it.', held: 'Crossbars and platform studs' },
+    rods: { name: 'Carbon rods', kind: 'structure', lbl: 'PARALLELOGRAM RODS', key: true, short: '300 mm, 6 rods', info: 'Rods only push and pull, so they can be thin, hollow and light. Two equal parallel rods per arm keep the platform level.', held: 'Ball joints at both ends', spec: 're = 300 mm' },
+    springs: { name: 'Preload springs', kind: 'structure', short: 'hold cups on balls', info: 'If the platform crashes, the cups pop off instead of breaking something: snap them back on.', held: 'Hooks on the rod ends' },
+    plate: { name: 'Moving platform', kind: 'tool', lbl: 'PLATFORM', key: true, short: 'translation only', info: 'Moving mass is just the platform, rods and tool: under 0.5 kg.', held: 'Six rod ends' },
+    cup: { name: 'Vacuum cup', kind: 'tool', lbl: 'CUP', short: 'suction gripper', info: 'Picks flat parts in a few milliseconds.', held: 'The platform' },
+    vac: { name: 'Vacuum hose', kind: 'wiring', short: 'to the valve', info: 'The valve sits up on the plate, not on the platform, to keep the moving mass low.', held: 'The cup and the top plate' },
+    pads: { shadow: 'pads', name: 'Pads A and B', kind: 'structure', short: 'pick and place spots', info: 'Pad A on the left, B on the right, 240 mm apart.', held: 'The table' },
+    pucks: { shadow: 'pucks', name: 'Parts', kind: 'tool', short: '5 stacked parts', info: 'Each pick lowers onto the top of the stack, so every cycle has a different depth.', held: 'The pads' },
+  },
+  concepts: [
+    ['Parallel vs serial', 'A serial arm stacks motors on motors, each carrying the next. A parallel robot puts all motors on the base and joins them at the tool through several chains. Lighter and faster, but a smaller workspace.'],
+    ['Inverse kinematics is easy here', 'For a platform point, each arm’s angle solves on its own: the elbow must lie on a sphere of radius re around its platform joint and on the arm’s circle. Two answers; the robot uses the elbow-out one. Drag the yellow ring and watch three angles change together.'],
+    ['Forward kinematics is the hard way round', 'From three angles, the platform is where three spheres (one around each elbow) meet: a small equation to solve. Serial arms are the opposite: forward is easy, inverse is hard.'],
+    ['Always level', 'Each pair of equal parallel rods is a parallelogram. Three parallelograms at 120 degrees lock all rotation, leaving only X, Y and Z.'],
+    ['Speed and acceleration', 'Picks per minute are limited by acceleration, not top speed: on a 25-305-25 mm cycle the platform barely reaches full speed. Push the speed override up and watch the g readout.'],
+  ],
+  draw: dlDraw,
+  active: st => { const a = {}; if (st.thd.some(v => Math.abs(v) > .5)) a.motors = a.gearboxes = a.arms = true; if (st.vac) a.cup = a.vac = true; return a; },
+  enterOp: st => { st.goal = null; },
+  opHTML: () => `<div class="row2"><button id="dlrun">Run</button><button id="dlone">One cycle</button><button id="dlvac">Vacuum on</button><button id="dlhome">Home</button><button id="dlreset">Reset parts</button></div>
+    <p class="note">Drag the yellow ring under the platform to move it; the arms follow by inverse kinematics.</p>
+    ${slHTML('dlx', 'X', -17, 17, .5, ' cm')}${slHTML('dly', 'Y', -17, 17, .5, ' cm')}${slHTML('dlz', 'Z (height above table)', DL.ZMIN - 3, DL.ZMAX - 3, .5, ' cm')}
+    ${slHTML('dlspd', 'Speed override', 5, 100, 5, '%')}
+    <div class="row2"><button id="dltr" aria-pressed="true">Trace</button><button id="dlclr">Clear trace</button></div>`,
+  opBind(el, st, ui, lab){ const $ = id => document.getElementById(id);
+    const go = p => { st.run = false; st.prog = []; st.goal = dlClamp(p); const c = dlHit(st, st.goal); if (c){ st.goal = null; st.crash = { at: c.at, t: 1 }; st.crashes++; lab.flash(c.why + ' — move refused'); } lab.kick(); };
+    $('s_dlx').oninput = e => go([DL.C + +e.target.value, (st.goal || st.P)[1], (st.goal || st.P)[2]]);
+    $('s_dly').oninput = e => go([(st.goal || st.P)[0], DL.C + +e.target.value, (st.goal || st.P)[2]]);
+    $('s_dlz').oninput = e => go([(st.goal || st.P)[0], (st.goal || st.P)[1], +e.target.value + 3]);
+    $('s_dlspd').oninput = e => { st.speed = +e.target.value/100; ui.render(); };
+    $('dlrun').onclick = () => { st.run = !st.run; if (st.run && st.held) { st.run = false; return lab.flash('Drop the part first (Vacuum off)'); } lab.kick(); ui.render(); };
+    $('dlone').onclick = () => { if (st.prog.length) return lab.flash('Already running a cycle'); if (st.held) return lab.flash('Drop the part first (Vacuum off)'); dlCycle(st, lab); lab.kick(); };
+    $('dlvac').onclick = () => { dlVac(st, !st.vac, lab); ui.render(); };
+    $('dlhome').onclick = () => go(DL_HOME);
+    $('dlreset').onclick = () => { st.run = false; st.prog = []; st.held = false; st.vac = false; st.stack = { A: 5, B: 0 }; ui.render(); };
+    $('dltr').onclick = () => { st.trace = !st.trace; ui.render(); }; $('dlclr').onclick = () => { st.trail = []; ui.render(); }; },
+  opSync(el, st){ const $ = id => document.getElementById(id), g = st.goal || st.P;
+    slSync('dlx', g[0] - DL.C, `${((st.P[0] - DL.C)*10).toFixed(0)} mm`); slSync('dly', g[1] - DL.C, `${((st.P[1] - DL.C)*10).toFixed(0)} mm`); slSync('dlz', g[2] - 3, `${((st.P[2] - 3)*10).toFixed(0)} mm`, st.P[2] <= DL.ZMIN + .01 || st.P[2] >= DL.ZMAX - .01);
+    slSync('dlspd', Math.round(st.speed*100), Math.round(st.speed*100) + '%');
+    $('dlrun').textContent = st.run ? 'Stop' : 'Run'; $('dlrun').setAttribute('aria-pressed', st.run);
+    $('dlvac').textContent = st.vac ? 'Vacuum off' : 'Vacuum on'; $('dltr').setAttribute('aria-pressed', st.trace); },
+  readout(st){ const rows = [];
+    st.th.forEach((a, i) => rows.push({ k: `Arm ${i + 1} ${a.toFixed(1)}°`, bar: Math.abs(st.thd[i])/1200, v: `${(Math.abs(st.thd[i])/6).toFixed(0)} rpm`, warn: Math.abs(st.thd[i])/6 > 190, tip: 'Arm speed (motor turns 15x faster)' }));
+    rows.push({ k: 'Platform speed', bar: st.vel/DL.VMAX, v: `${(st.vel/100).toFixed(2)} m/s` });
+    rows.push({ k: 'Acceleration', bar: Math.abs(st.acc)/DL.AMAX, v: `${(Math.abs(st.acc)/981).toFixed(1)} g` });
+    rows.push({ k: 'Platform tilt', v: '0.0° (always)', tip: 'Parallelograms lock rotation' });
+    rows.push({ k: 'Stacks A / B', v: `${st.stack.A} / ${st.stack.B}${st.held ? ' + 1 held' : ''}` });
+    rows.push({ k: 'Cycle time', v: st.prog.length ? st.cycle.toFixed(2) + ' s' : st.lastCycle ? st.lastCycle.toFixed(2) + ' s' : '—' });
+    rows.push({ k: 'Picks per minute', v: st.lastCycle ? (60/st.lastCycle).toFixed(0) : '—', tip: 'At this speed override' });
+    rows.push({ k: 'Cycles / crashes', v: `${st.cycles} / ${st.crashes}`, warn: !!st.crash });
+    return rows; },
+  stats: st => [{ label: 'Platform X Y Z mm', value: `${Math.round((st.P[0]-DL.C)*10)} ${Math.round((st.P[1]-DL.C)*10)} ${Math.round((st.P[2]-3)*10)}`, small: true }],
+  tick: dlTick,
+  onDrag(st, dx, dy, phase, lab){
+    if (phase === 'start'){ st.run = false; st.prog = []; st.goal = null; st.dragP = st.P.slice(); return; } if (phase !== 'move') return;
+    const p = dlClamp(vAdd(st.dragP, dragWorld(dx, dy))), c = dlHit(st, p); if (c) return lab.flash(c.why.replace('Crash: ', 'Blocked: '));
+    const r = dlIK(p); if (r.err) return lab.flash(r.err); st.dragP = p; st.goal = p; },
+  params(st, q){ if (q.has('p')){ const v = q.get('p').split(',').map(Number), r = dlIK(v); if (r.th){ st.P = v; st.th = r.th; } } if (q.get('demo') === 'run') st.run = true; },
+};
+ROBOT_ORDER.push({ id: 'delta', name: 'Delta picker', blurb: 'Three motors on a fixed top plate drive three parallelogram arms down to one small platform: extremely fast, always level. Run pick & place and watch the g-forces.', chips: ['3 DOF', 'Parallel', 'Closed chain'] });
+
+/* ============================================================
+   Robot 07 — three-finger tendon gripper (underactuated, ~20 cm hand). 1 unit = 1 cm.
+   Truth: each finger has three phalanges on pin joints but only one motor. The motor winds a tendon onto a spool; the
+   tendon runs down the inside of the finger over every joint, so pulling it curls all three. Return springs on the back
+   of each joint open the finger; the springs get stiffer toward the tip, so the finger closes base-first. When a phalanx
+   touches the object it stops and the rest keep curling: the finger wraps itself around the shape with no extra motors
+   or sensing. Force sensors in the pads tell the controller when to stop pulling.
+   The hand hangs from an arm's Z slide; test objects sit on a plinth below.
+   Parts: mount | motors, spools | ctrl | palm | prox, pins | mid, dist | springs | tendons | pads, fsr | plinth, objects
+   ============================================================ */
+const GP = { C: [21, 17], RP: 4, L: [4.4, 3.6, 2.8], TH: .75, RT: .6, KT: 60, VS: 1.6, MU: .7, PLT: 7 };
+const GP_REST = [-26, 8, 8], GP_LIM = [80, 95, 85], GP_K = [.1, .17, .26];
+const GP_PHI = [90, 210, 330].map(a => a*DEG);
+const GP_OBJ = {
+  ball: { label: 'Ball', cage: true, top: 8, kg: .3, c: '#ef6a4c', sdf: (r, h, hc) => Math.hypot(r, h - hc) - 4, hc: 4, note: 'Envelops: fingers curl under its equator, so it is caged.' },
+  can:  { label: 'Can', top: 9, kg: .35, c: '#5a82c6', sdf: (r, h, hc) => gpBox(r, h - hc, 3, 4.5), hc: 4.5, note: 'Straight sides: nothing to curl under, so friction alone must carry its weight.' },
+  box:  { label: 'Box', top: 5.2, kg: .2, c: '#d49c1f', sdf: (r, h, hc, phi) => gpBox(r, h - hc, 2.6/Math.max(Math.abs(Math.cos(phi)), Math.abs(Math.sin(phi))), 2.6), hc: 2.6, note: 'Flat faces and corners: the fingers meet it at different points.' },
+  egg:  { label: 'Egg', cage: true, top: 6, kg: .06, c: '#f2efe7', sdf: (r, h, hc) => (Math.hypot(r/2.2, (h - hc)/3) - 1)*2.2, hc: 3, crush: 6, note: 'Fragile: breaks above 6 N on any finger. Keep the force limit low.' } };
+function gpBox(x, y, a, b){ const dx = Math.abs(x) - a, dy = Math.abs(y) - b; return Math.hypot(Math.max(dx, 0), Math.max(dy, 0)) + Math.min(Math.max(dx, dy), 0); }
+
+// finger chain in its own plane: r = distance from the hand axis, h = depth below the palm
+function gpChain(th){ let r = GP.RP, h = 0, Th = 0; const pts = [[r, h]], ang = [];
+  for (let j = 0; j < 3; j++){ Th += th[j]*DEG; r += -GP.L[j]*Math.sin(Th); h += GP.L[j]*Math.cos(Th); pts.push([r, h]); ang.push(Th); }
+  return { pts, ang }; }
+// signed distance from a finger-plane point to whatever is there (object, plinth, table)
+function gpSdf(st, i, r, h){ const O = GP_OBJ[st.obj], zb = GP.PLT + st.objZ, hc = st.zp - (zb + O.hc);
+  let d = st.broken ? 99 : O.sdf(r, h, hc, GP_PHI[i]);
+  d = Math.min(d, gpBox(r, h - (st.zp - 5), 3.5, 2), st.zp - 3 - h); return d; }
+function gpHits(st, i, th, from){ const { pts } = gpChain(th); let hit = -1;
+  for (let j = from; j < 3; j++) for (let k = 1; k <= 5; k++){ const t = k/5, p = [pts[j][0] + (pts[j+1][0] - pts[j][0])*t, pts[j][1] + (pts[j+1][1] - pts[j][1])*t];
+    if (gpSdf(st, i, p[0], p[1]) < GP.TH){ hit = j; break; } }
+  return hit; }
+// quasi-static finger: tendon tension T balances the springs (theta' = T r / k) unless a joint is stopped by contact
+// (cap). Solve T from the tendon length wound in (s = sum r theta' + T / k_tendon), then move joints, probing for contact.
+function gpSolveT(s, cap){ const used = T => [0, 1, 2].reduce((a, j) => a + GP.RT*Math.min(T*GP.RT/GP_K[j], cap[j])*DEG, 0) + T/GP.KT;
+  if (s <= 0) return 0; let lo = 0, hi = 400; for (let k = 0; k < 40; k++){ const m = (lo + hi)/2; if (used(m) > s) hi = m; else lo = m; } return lo; }
+function gpStep(st, dt){
+  for (let i = 0; i < 3; i++){ const th = st.th[i], cap = [0, 1, 2].map(j => GP_LIM[j] - GP_REST[j]);
+    for (let it = 0; it < 3; it++){ const T = gpSolveT(st.s[i], cap); st.T[i] = T;
+      for (let j = 0; j < 3; j++){ const tgt = GP_REST[j] + Math.min(T*GP.RT/GP_K[j], cap[j]);
+        if (tgt <= th[j]){ th[j] = tgt; continue; }
+        while (th[j] < tgt - 1e-6){ const old = th[j]; th[j] = Math.min(tgt, th[j] + 1); if (gpHits(st, i, th, j) >= 0){ th[j] = old; cap[j] = old - GP_REST[j]; break; } } } }
+    // contacts and pad forces: the torque the tendon makes that the spring does not take is pushing on the object
+    st.con[i] = [0, 1, 2].map(j => { const { pts } = gpChain(th); let m = 99;
+      for (let k = 0; k <= 5; k++){ const t = k/5; m = Math.min(m, gpSdf(st, i, pts[j][0] + (pts[j+1][0] - pts[j][0])*t, pts[j][1] + (pts[j+1][1] - pts[j][1])*t)); }
+      return m < GP.TH + .12; });
+    st.F[i] = st.con[i].reduce((a, c, j) => a + (c ? Math.max(0, st.T[i]*GP.RT - GP_K[j]*(th[j] - GP_REST[j]))/(GP.L[j]*.6) : 0), 0); } }
+function gpGrasp(st){ const O = GP_OBJ[st.obj], hc = st.zp - (GP.PLT + st.objZ + O.hc);
+  const touching = st.con.filter(c => c.some(Boolean)).length, caged = !!O.cage && st.con.filter((c, i) => c[2] && gpChain(st.th[i]).pts[3][1] > hc + .3).length >= 2;
+  const hold = GP.MU*st.F.reduce((a, b) => a + b, 0), W = O.kg*9.81, n = st.con.flat().filter(Boolean).length;
+  return { touching, caged, hold, W, n, ok: !st.broken && touching >= 2 && (caged || hold >= W*1.2), type: touching < 2 ? 'none' : n >= 6 ? 'envelope (power) grasp' : 'fingertip (pinch) grasp' }; }
+
+function gpDraw(st, m){
+  const [cx, cy] = GP.C, zp = st.zp, zb = GP.PLT + st.objZ;
+  const W3 = (i, r, h) => [cx + r*Math.cos(GP_PHI[i]), cy + r*Math.sin(GP_PHI[i]), zp - h];
+  // ---- mount: post, boom, Z slide sleeve and rod down to the palm
+  sbPart('mount'); qBox(T_I, [4, cy - 2, 3], [8, cy + 2, 42], ALU, { w: 1.1 }); qBox(T_I, [3, cy - 3, 3], [9, cy + 3, 3.6], STEEL, { w: .7 });
+  qBox(T_I, [4, cy - 1.6, 39], [cx + 2, cy + 1.6, 42], ALU, { w: 1.1 }); qBox(T_I, [cx - 2, cy - 2, 34], [cx + 2, cy + 2, 39], MOTOR, { w: .9 });
+  qRod([cx, cy, 34], [cx, cy, zp + 4.6], .9, STEEL, { w: .8 }); qRod([cx, cy, zp + 4.6], [cx, cy, zp + 4], 2.4, STEEL, { w: .8 });
+  // ---- palm: three motors with spools, controller board, cover
+  sbGroup('palm', T_I, [cx - 6.5, cy - 6.5, zp], [cx + 6.5, cy + 6.5, zp + 4]);
+  for (let i = 0; i < 3; i++){ const a = GP_PHI[i] + Math.PI, x = cx + 2.4*Math.cos(a), y = cy + 2.4*Math.sin(a);
+    sbPart('motors'); qRod([x, y, zp + 3.8], [x, y, zp + 1.6], 1.1, MOTOR, { w: .8 });
+    sbPart('spools'); qRod([x, y, zp + 1.6], [x, y, zp + .6], 1.25, BRASS, { w: .7 }); }
+  sbPart('ctrl'); qBox(T_I, [cx - 1.4, cy - 4.8, zp + .4], [cx + 1.4, cy - 3.6, zp + 3.6], PCB, { w: .6 });
+  sbPart('palm'); qExt(T_I, ellUV(cx, cy, 6.5, 6.5, 24), zp, zp + 4, m, { ax: 'z', cover: true, w: 1.8 });
+  sbFree(); if (facing([0, -1, 0])) sbPut(txT(T_I, [cx, cy - 6.55, zp + 2], [1,0,0], [0,0,1], 'TRI-3', 1.6), obbW([cx - 3, cy - 6.6, zp + 1], [cx + 3, cy - 6.5, zp + 3]), { p: 'palm' });
+  // ---- fingers
+  const linkPart = ['prox', 'mid', 'dist'], wd = [1.1, 1, .9];
+  for (let i = 0; i < 3; i++){ const { pts, ang } = gpChain(st.th[i]), u = [Math.cos(GP_PHI[i]), Math.sin(GP_PHI[i]), 0], t = [-u[1], u[0], 0];
+    const wv = (dr, dh) => [u[0]*dr, u[1]*dr, -dh];
+    sbPart('pins'); qRod(vAdd(W3(i, GP.RP, -.4), vSc(t, -1.6)), vAdd(W3(i, GP.RP, -.4), vSc(t, 1.6)), .5, ALU, { w: .6 });
+    for (let j = 0; j < 3; j++){ const Th = ang[j], X = wv(-Math.sin(Th), Math.cos(Th)), N = wv(-Math.cos(Th), -Math.sin(Th)), T = tFrame(W3(i, ...pts[j]), X, t), s = dot(N, tAx(T, 2)) > 0 ? 1 : -1;
+      const hit = st.con[i][j], col = m;
+      sbPart(linkPart[j]); qBox(T, [.3, -wd[j], -.65], [GP.L[j] - .3, wd[j], .65], col, { w: .8, sh: tone });
+      sbPart('pins'); qRod(vAdd(W3(i, ...pts[j]), vSc(t, -wd[j] - .3)), vAdd(W3(i, ...pts[j]), vSc(t, wd[j] + .3)), .32, STEEL, { w: .5 });
+      sbPart('pads'); qBox(T, [.6, -wd[j] + .15, s > 0 ? .65 : -.95], [GP.L[j] - .5, wd[j] - .15, s > 0 ? .95 : -.65], hit ? matOf('#43c25c') : RUBBER, { w: .6 });
+      if (j === 2){ sbPart('fsr'); qBox(T, [GP.L[j] - 1.6, -.5, s > 0 ? .95 : -1.05], [GP.L[j] - .6, .5, s > 0 ? 1.05 : -.95], matOf('#e2483d'), { w: .4 }); }
+      // return spring across the back of the joint
+      if (j > 0){ const B0 = W3(i, ...pts[j]), back = (k, Th2) => vAdd(B0, vAdd(vSc(wv(-Math.sin(Th2), Math.cos(Th2)), k), vSc(wv(Math.cos(Th2), Math.sin(Th2)), .85)));
+        sbPart('springs'); qHelix(back(-.9, ang[j - 1]), back(.9, Th), .25, 5, '#c6ccce', { w: .45 }); } }
+    // tendon: from the spool, down the inside of each link, to the tip
+    sbPart('tendons'); const tp = [[cx + 2.4*Math.cos(GP_PHI[i] + Math.PI), cy + 2.4*Math.sin(GP_PHI[i] + Math.PI), zp + 1.1], W3(i, GP.RP - .6, -.2)];
+    for (let j = 0; j < 3; j++){ const Th = ang[j], n = [-Math.cos(Th), -Math.sin(Th)]; for (const k of [.15, .85]) tp.push(W3(i, pts[j][0] + (pts[j+1][0] - pts[j][0])*k + n[0]*.45, pts[j][1] + (pts[j+1][1] - pts[j][1])*k + n[1]*.45)); }
+    qWire(tp, st.T[i] > .5 ? '#e2483d' : CABLE.sig, .16, { seg: 2.5, bend: .4 }); }
+  // ---- plinth and the object
+  sbPart('plinth'); qRod([cx, cy, 3], [cx, cy, GP.PLT], 3.5, matOf('#9db2cc'), { w: 1, sh: tone });
+  sbPart('objects'); const O = GP_OBJ[st.obj], col = matOf(st.broken ? '#f4b829' : O.c);
+  if (st.obj === 'ball') qBall([cx, cy, zb + 4], 4, col, { w: 1.2 });
+  else if (st.obj === 'can') qRod([cx, cy, zb], [cx, cy, zb + 9], 3, col, { w: 1.1, sh: tone, deco: () => txT(T_I, [cx, cy - 3.05, zb + 4.5], [1,0,0], [0,0,1], 'SODA', 1.6, '#fff') });
+  else if (st.obj === 'box') qBox(T_I, [cx - 2.6, cy - 2.6, zb], [cx + 2.6, cy + 2.6, zb + 5.2], col, { w: 1, sh: tone });
+  else if (st.broken) qRod([cx, cy, zb], [cx, cy, zb + .8], 2.6, col, { w: .9, r1: 1.6, sh: tone });
+  else { sbPut(`<ellipse cx="${f(P(cx, cy, zb + 3)[0])}" cy="${f(P(cx, cy, zb + 3)[1])}" rx="${f(2.2*CAM_K)}" ry="${f(3*CAM_K)}" fill="${col.l}" stroke="${INK}" stroke-width="1"/>`, obbW([cx - 2.2, cy - 2.2, zb], [cx + 2.2, cy + 2.2, zb + 6])); }
+  const pt = boardTop(0, 0, 36, 34, 3, 6); let over = '';
+  if (st.crash) over += crashBurst(st.crash.at, st.crash.t);
+  return { under: board(0, 0, 36, 34, 3, 6), z0: 3, clip: pt, over };
+}
+
+function gpTick(st, dt, ui, lab){
+  let more = false;
+  const lim = st.limit, maxT = Math.max(...st.T);
+  for (let i = 0; i < 3; i++){ if (st.cmd === 'close'){ if (st.T[i] < lim) st.s[i] += GP.VS*dt; else st.s[i] -= (st.T[i] - lim)/GP.KT*.5; }
+    else if (st.cmd === 'open') st.s[i] = Math.max(0, st.s[i] - GP.VS*2*dt); }
+  const before = st.th.flat(); gpStep(st, dt); const changed = st.th.flat().some((v, k) => Math.abs(v - before[k]) > 1e-3);
+  const O = GP_OBJ[st.obj];
+  if (O.crush && !st.broken && Math.max(...st.F) > O.crush){ st.broken = true; st.att = false; st.objZ = 0; st.crash = { at: [GP.C[0], GP.C[1], GP.PLT + 3], t: 1 }; st.crashes++; lab.flash(`Crushed! ${Math.max(...st.F).toFixed(1)} N on one finger — lower the force limit`); }
+  // Z slide: move toward the target; a held object comes along, a weak grasp lets it slip
+  const dz = st.zpT - st.zp;
+  if (Math.abs(dz) > 1e-3){ const step = Math.sign(dz)*Math.min(Math.abs(dz), 8*dt);
+    if (step > 0 && !st.att && st.objZ === 0){ const g = gpGrasp(st); if (g.touching >= 2){ if (g.ok){ st.att = true; lab.flash(g.caged ? 'Lifted: the fingers cage it from below' : 'Lifted: friction holds it'); } else lab.flash(`Slipped: friction ${g.hold.toFixed(1)} N < weight ${g.W.toFixed(1)} N`); } }
+    st.zp += step; if (st.att) st.objZ += step; more = true; }
+  if (st.att){ const g = gpGrasp(st); if (!g.ok){ st.att = false; st.objZ = 0; lab.flash('Dropped: the grip let go'); } }
+  if (st.crash){ st.crash.t -= dt/1.2; if (st.crash.t <= 0) st.crash = null; else more = true; }
+  const settling = st.cmd === 'close' ? Math.abs(maxT - lim) > .3 && st.s.some(v => v < 6) : st.s.some(v => v > 0);
+  return more || changed || settling || !!st.crash;
+}
+const gpApproach = obj => GP.PLT + GP_OBJ[obj].top + 1.2;
+
+ROBOTS.gripper = {
+  id: 'gripper', fig: '07', name: 'Three-finger gripper', pal: 'mint', kicker: '9 joints · 3 motors · tendons · force sensing',
+  blurb: 'Three fingers, nine joints, only three motors. Each motor pulls one tendon; springs and contact decide how the finger bends, so it wraps itself around whatever shape is there.',
+  size: [36, 34, 40], center: [18, 17], bounds: [2, 34, 2, 32, 0, 40],
+  init: () => ({ obj: 'ball', zp: gpApproach('ball'), zpT: gpApproach('ball'), objZ: 0, att: false, broken: false, th: [0, 1, 2].map(() => GP_REST.slice()), s: [0, 0, 0], T: [0, 0, 0], F: [0, 0, 0],
+    con: [0, 1, 2].map(() => [false, false, false]), cmd: 'open', limit: 15, crash: null, crashes: 0 }),
+  thumbYaw: 0,
+  steps: [
+    { title: 'Mount & Z slide', parts: ['mount'], text: 'The hand hangs from a robot arm’s wrist; here a post, a boom and a vertical slide stand in for the arm.' },
+    { title: 'Finger motors & spools', parts: ['motors', 'spools'], peek: true, text: 'One small gear motor per finger, axis vertical, with a spool on its shaft. Turning the spool winds in that finger’s tendon.' },
+    { title: 'Controller board', parts: ['ctrl'], text: 'Reads the three pad force sensors and the motor currents, and decides when to stop pulling.' },
+    { title: 'Palm shell', parts: ['palm'], text: 'The palm closes over the drives. The fingers pivot on its rim, 120 degrees apart.' },
+    { title: 'Proximal phalanges & pins', parts: ['prox', 'pins'], text: 'The first link of each finger, on a steel pin through the palm rim. At rest the springs hold it splayed outward.' },
+    { title: 'Middle & distal phalanges', parts: ['mid', 'dist'], text: 'Two more links per finger on their own pins. Nine joints in all, and still only three motors.' },
+    { title: 'Return springs', parts: ['springs'], text: 'A spring across the back of each joint opens it. Stiffer toward the tip, so pulling the tendon bends the base joint first.' },
+    { title: 'Tendons', parts: ['tendons'], text: 'A braided cord from each spool runs down the inside of its finger past every joint to the fingertip. It turns red when it is under tension.' },
+    { title: 'Pads & force sensors', parts: ['pads', 'fsr'], text: 'Rubber pads give friction; a thin force-sensing resistor in each fingertip changes resistance with pressure. Pads turn green where they touch.' },
+    { title: 'Plinth & test object', parts: ['plinth', 'objects'], text: 'Something to grasp. In Operate, pick a shape, set the force limit and press Close, then Lift.' },
+  ],
+  parts: {
+    mount: { name: 'Mount & Z slide', kind: 'structure', lbl: 'Z SLIDE', key: true, short: 'stands in for the arm', info: 'Lowers the hand over the object and lifts it for the grasp test.', held: 'Bolted to the bench' },
+    motors: { name: 'Finger motors (×3)', kind: 'motor', lbl: 'FINGER MOTORS', inside: true, short: 'DC gear motors, 100:1', info: 'One motor per finger, not per joint. Current through it is proportional to tendon tension, so it doubles as a force sensor.', held: 'The palm floor' },
+    spools: { name: 'Tendon spools', kind: 'gear', lbl: 'SPOOLS', inside: true, short: '5 mm radius', info: 'Tension = motor torque / spool radius.', held: 'The motor shafts' },
+    ctrl: { name: 'Controller board', kind: 'electronics', lbl: 'CONTROLLER', inside: true, short: 'force loop', info: 'Closes each finger until its force reaches the limit, then holds: force control rather than position control.', held: 'Inside the palm' },
+    palm: { name: 'Palm', kind: 'cover', lbl: 'PALM', key: true, short: 'printed shell', info: 'Holds the three finger pivots 120 degrees apart around the axis.', held: 'The wrist flange' },
+    prox: { name: 'Proximal phalanges', kind: 'structure', lbl: 'PROXIMAL', key: true, short: '44 mm', info: 'Softest spring: closes first.', held: 'Pins in the palm rim', spec: 'k = 0.10 N cm/deg' },
+    mid: { name: 'Middle phalanges', kind: 'structure', lbl: 'MIDDLE', short: '36 mm', info: 'Keeps curling after the proximal link is stopped by the object.', held: 'Pins on the proximal links', spec: 'k = 0.17 N cm/deg' },
+    dist: { name: 'Distal phalanges', kind: 'structure', lbl: 'DISTAL', short: '28 mm', info: 'Stiffest spring: the fingertip curls last, closing round the far side of the object.', held: 'Pins on the middle links', spec: 'k = 0.26 N cm/deg' },
+    pins: { name: 'Joint pins', kind: 'structure', short: 'steel pins', info: 'Plain pivots, no motors: these joints are passive.', held: 'Press-fit in the links' },
+    springs: { name: 'Return springs', kind: 'structure', lbl: 'SPRINGS', short: 'one per joint', info: 'The tendon pulls against them. Their stiffness ratio decides the closing order.', held: 'Hooks across the back of each joint' },
+    tendons: { name: 'Tendons', kind: 'gear', lbl: 'TENDONS', key: true, short: 'braided cord', info: 'One tendon passes every joint at the same 6 mm moment arm, so the same tension makes the same torque at each joint.', held: 'The spool and the fingertip anchor' },
+    pads: { name: 'Rubber pads', kind: 'tool', lbl: 'PADS', short: 'grip friction μ ≈ 0.7', info: 'Friction force = μ × squeeze. A fingertip grasp relies on it entirely.', held: 'Glued to every link' },
+    fsr: { name: 'Fingertip force sensors', kind: 'sensor', lbl: 'FORCE SENSORS', short: 'FSR in each tip', info: 'Force-sensing resistors: pressure on the film lowers its resistance.', held: 'Under the distal pads' },
+    plinth: { shadow: 'plinth', name: 'Plinth', kind: 'structure', short: 'object stand', info: 'Holds the test object at a reachable height.', held: 'The bench' },
+    objects: { shadow: 'obj', name: 'Test object', kind: 'tool', lbl: 'OBJECT', short: 'ball, can, box or egg', info: 'Choose a shape in Operate. The same motor command gives a different finger shape for each.', held: 'The plinth' },
+  },
+  concepts: [
+    ['Underactuation', 'Fewer motors than joints: 3 motors, 9 joints. The missing control comes from the springs and from contact with the object. The hand adapts its shape for free, but it cannot place each joint where you want.'],
+    ['Why the stiffness gradient', 'All three joints feel the same tendon torque, so the softest joint moves most. Soft at the base, stiff at the tip: the finger closes base first, then curls its tip around, like your own fingers.'],
+    ['Envelope vs fingertip grasp', 'An envelope (power) grasp wraps many links round the object and cages it: it holds even at low force. A fingertip (pinch) grasp touches with the tips only and relies on friction: squeeze harder or it slips.'],
+    ['Force control', 'The controller pulls until the pad force reaches the limit and then holds it. Set the limit low for the egg; too low and the can slips when lifted.'],
+    ['Friction needed to lift', 'To hold by friction alone: μ × total squeeze ≥ weight. The readout compares the two; the Lift button tests it.'],
+  ],
+  draw: gpDraw,
+  active: st => { const a = {}; if (st.T.some(t => t > .5)) a.motors = a.spools = a.tendons = true; if (st.F.some(v => v > .2)) a.fsr = a.pads = true; return a; },
+  opHTML: () => `<div class="seg" id="gpobj">${Object.entries(GP_OBJ).map(([k, o]) => `<button data-o="${k}">${o.label}</button>`).join('')}</div>
+    <div class="row2"><button id="gpclose">Close</button><button id="gpopen">Open</button><button id="gplift">Lift</button><button id="gplower">Lower</button></div>
+    <p class="note" id="gpnote"></p>
+    ${slHTML('gplim', 'Force limit (tendon)', 2, 40, 1, ' N')}`,
+  opBind(el, st, ui, lab){ const $ = id => document.getElementById(id);
+    el.querySelectorAll('#gpobj button').forEach(b => b.onclick = () => { st.obj = b.dataset.o; st.broken = false; st.att = false; st.objZ = 0; st.cmd = 'open';
+      st.s = [0, 0, 0]; st.th = [0, 1, 2].map(() => GP_REST.slice()); st.zp = st.zpT = gpApproach(st.obj); lab.kick(); ui.render(); });
+    $('gpclose').onclick = () => { if (st.zpT > gpApproach(st.obj) + .1 && !st.att) lab.flash('Closing in the air: press Lower to reach the object'); st.cmd = 'close'; lab.kick(); };
+    $('gpopen').onclick = () => { st.cmd = 'open'; lab.kick(); };
+    $('gplift').onclick = () => { st.zpT = gpApproach(st.obj) + 10; lab.kick(); };
+    $('gplower').onclick = () => { st.zpT = gpApproach(st.obj) + st.objZ; lab.kick(); };
+    $('s_gplim').oninput = e => { st.limit = +e.target.value; lab.kick(); ui.render(); }; },
+  opSync(el, st){ const $ = id => document.getElementById(id);
+    el.querySelectorAll('#gpobj button').forEach(b => b.setAttribute('aria-pressed', b.dataset.o === st.obj));
+    $('gpclose').setAttribute('aria-pressed', st.cmd === 'close'); $('gpopen').setAttribute('aria-pressed', st.cmd === 'open');
+    $('gpnote').textContent = (st.broken ? 'Broken! Pick the egg again to reset. ' : '') + GP_OBJ[st.obj].note;
+    slSync('gplim', st.limit, `${st.limit} N`); },
+  readout(st){ const g = gpGrasp(st), rows = [];
+    for (let i = 0; i < 3; i++) rows.push({ k: `Finger ${i + 1} (${st.con[i].filter(Boolean).length}/3 touch)`, bar: st.T[i]/40, v: `${st.T[i].toFixed(0)} / ${st.F[i].toFixed(1)} N`, tip: 'Tendon tension / pad force', warn: GP_OBJ[st.obj].crush && st.F[i] > GP_OBJ[st.obj].crush*.8 });
+    rows.push({ k: 'Finger 1 joints', v: st.th[0].map(v => v.toFixed(0) + '°').join(' ') });
+    rows.push({ k: 'Grasp', v: g.type.split(' ')[0] + (g.caged ? ', caged' : ''), tip: g.type });
+    rows.push({ k: 'Friction capacity', bar: g.hold/Math.max(g.W*2, .1), v: `${g.hold.toFixed(1)} / ${g.W.toFixed(1)} N`, warn: g.touching >= 2 && !g.ok, tip: 'μ × total pad force vs the object’s weight' });
+    rows.push({ k: 'Motor current (est.)', bar: Math.max(...st.T)/40, v: `${(Math.max(...st.T)*.005/0.02/100*1000).toFixed(0)} mA` });
+    rows.push({ k: 'Lifted', v: st.att ? `yes, ${(st.objZ*10).toFixed(0)} mm` : 'no' });
+    rows.push({ k: 'Broken objects', v: `${st.crashes}`, warn: st.broken });
+    return rows; },
+  stats: st => [{ label: 'Max finger force', value: `${Math.max(...st.F).toFixed(1)} N`, small: true }],
+  tick: gpTick,
+  enterOp: st => { st.cmd = st.cmd || 'open'; },
+  params(st, q){ if (q.has('obj') && GP_OBJ[q.get('obj')]){ st.obj = q.get('obj'); st.zp = st.zpT = gpApproach(st.obj); }
+    if (q.get('demo') === 'close'){ st.cmd = 'close'; for (let k = 0; k < 240; k++){ for (let i = 0; i < 3; i++) if (st.T[i] < st.limit) st.s[i] += GP.VS/60; gpStep(st, 1/60); } } },
+};
+ROBOT_ORDER.push({ id: 'gripper', name: 'Three-finger gripper', blurb: 'Tendon-driven fingers with one motor each, compliant joints and force sensing: watch them wrap a ball, pinch a box, lift a can and (gently) hold an egg.', chips: ['Underactuated', 'Tendons', 'Force sensing'] });
+
+/* ============================================================
+   Robot 08 — CNC gantry plotter (36 x 24 cm work area, pen on a Z axis). 1 unit = 1 cm.
+   Truth: two aluminium extrusion rails on feet. A beam (the gantry) rides both rails on wheeled carriages; two X steppers,
+   one per rail, pull it along by GT2 timing belts so it cannot twist. A Y stepper on the beam's end drives a belt to the
+   Y carriage. On the carriage a small Z stepper turns a lead screw that raises and lowers the pen holder. Limit switches
+   at the rail ends find home. A controller board with three stepper drivers reads G-code and sends step pulses.
+   Steppers have no position sensor: the controller only counts the steps it sent. Ask for too much speed and a motor
+   slips, and from then on the machine is wrong about where it is.
+   Parts: frame, endstops | bed, paper | xmotors, xbelts | gantry | ymotor, ybelt | ycarr | zmotor, leadscrew | pen |
+          ctrl, drivers, psu | case | cables
+   ============================================================ */
+const GT = { X0: 8, Y0: 8, XW: 36, YW: 24, PZ: 4.06, PUP: .8, OFF: 3.8, ACC: 150, RAPID: 15, STALLX: 16, STALLY: 20 };
+const GT_MICRO = [1, 4, 16];
+const gtSPmm = (axis, mu) => axis === 2 ? 25*mu : 5*mu;       // belts: 200 steps / 40 mm; Z lead screw: 200 steps / 8 mm
+
+// a few drawings as G-code (machine coordinates in mm from the paper's corner)
+function gtProgram(kind){ const P = [], g = (code, x, y, z, txt) => P.push({ code, x, y, z, txt });
+  const pt = (x, y) => [Math.round(x*10)/10, Math.round(y*10)/10];
+  let paths = [];
+  if (kind === 'square') paths = [[[120, 60], [240, 60], [240, 180], [120, 180], [120, 60]]];
+  if (kind === 'circle') paths = [Array.from({ length: 49 }, (_, i) => { const a = i/48*2*Math.PI; return pt(180 + 80*Math.cos(a), 120 + 80*Math.sin(a)); })];
+  if (kind === 'star') paths = [Array.from({ length: 11 }, (_, i) => { const a = Math.PI/2 + i*4*Math.PI/5; return pt(180 + 95*Math.cos(a), 125 + 95*Math.sin(a)); })];
+  if (kind === 'spiral') paths = [Array.from({ length: 121 }, (_, i) => { const a = i/120*6*Math.PI, r = 8 + 80*i/120; return pt(180 + r*Math.cos(a), 120 + r*Math.sin(a)); })];
+  if (kind === 'grid') for (let k = 0; k <= 4; k++){ paths.push([[60, 40 + k*40], [300, 40 + k*40]]); paths.push([[60 + k*60, 40], [60 + k*60, 200]]); }
+  g('G21', null, null, null, 'G21 ; units: mm'); g('G90', null, null, null, 'G90 ; absolute coordinates');
+  for (const path of paths){ const [x0, y0] = path[0];
+    g('G0', null, null, GT.PUP*10, `G0 Z${GT.PUP*10} ; pen up`); g('G0', x0, y0, null, `G0 X${x0} Y${y0}`); g('G1', null, null, 0, 'G1 Z0 ; pen down');
+    for (const [x, y] of path.slice(1)) g('G1', x, y, null, `G1 X${x} Y${y}`); }
+  g('G0', null, null, GT.PUP*10, `G0 Z${GT.PUP*10} ; pen up`); g('G0', 0, 0, null, 'G0 X0 Y0 ; park');
+  return P; }
+
+function gtDraw(st, m){
+  const [px, py] = [GT.X0 + st.p[0] - st.err[0], GT.Y0 + st.p[1] - st.err[1]], X = px - GT.OFF, zt = GT.PZ + st.p[2];
+  // ---- frame rails on feet, endstops
+  sbPart('frame'); for (const y of [3, 37]){ qBox(T_I, [5, y - 1.3, 6], [49, y + 1.3, 8.6], ALU, { w: 1.1, deco: n => n[2] === 1 ? line([[5.4, y, 8.62], [48.6, y, 8.62]], .5) : '' });
+    for (const x of [6, 48]) qBox(T_I, [x - 1.5, y - 1.6, 3], [x + 1.5, y + 1.6, 6], STEEL, { w: .8 }); }
+  sbPart('endstops'); for (const y of [3, 37]) qBox(T_I, [5.4, y + 1.3, 8.6], [6.4, y + 2, 9.4], matOf('#e2483d'), { w: .5 });
+  qBox(T_I, [X - .6, 37.6, 17], [X + .4, 38.2, 17.8], matOf('#e2483d'), { w: .4 });
+  // ---- bed and paper, with the ink laid down so far
+  sbPart('bed'); qBox(T_I, [7, 7, 3], [45, 33, 4], matOf('#c9a476'), { w: 1 });
+  // the ink is drawn as part of the paper so it sorts with it
+  const ink = st.ink.map(s => trailSVG(s.map(([x, y]) => [GT.X0 + x, GT.Y0 + y, 4.06]), '#3f5fb0', .8)).join('');
+  sbPart('paper'); sbPut(qBoxNoPut(T_I, [GT.X0, GT.Y0, 4], [GT.X0 + GT.XW, GT.Y0 + GT.YW, 4.05], CERAMIC, toneI, .6) + ink, obbW([GT.X0, GT.Y0, 4], [GT.X0 + GT.XW, GT.Y0 + GT.YW, 4.05]));
+  // ---- X motors + belts (one per rail)
+  for (const y of [3, 37]){ sbPart('xmotors'); qBox(T_I, [.8, y - 2.1, 4.2], [5, y + 2.1, 8.4], MOTOR, { w: .9, deco: n => n[2] === 1 ? dotAt([2.9, y, 8.42], .5, STEEL.m, .3) : '' });
+    qCyl(T_I, 'y', [2.9, 9.4], y - .6, y + .6, .65, BRASS, { w: .5 });
+    sbPart('xbelts'); qBelt([2.9, y, 9.4], [48.4, y, 9.4], .65, .65, [0, 1, 0], '#2b2724', { w: 1.1 }); }
+  // ---- gantry: carriages on both rails, uprights, beam
+  sbPart('gantry'); for (const y of [3, 37]){ qBox(T_I, [X - 2.6, y - 1.8, 8.6], [X + 2.6, y + 1.8, 10.2], ALU, { w: .8 });
+    qBox(T_I, [X - 1.4, y - 1.4, 10.2], [X + 1.4, y + 1.4, 14], ALU, { w: .8 }); }
+  qBox(T_I, [X - 1.3, 2, 14], [X + 1.3, 38, 16.6], m, { w: 1.2, sh: tone, deco: n => n[0] === 1 ? txT(T_I, [X + 1.32, 20, 15.3], [0,1,0], [0,0,1], 'PLOT-36', 1.5) : '' });
+  // ---- Y motor and belt along the beam top
+  sbPart('ymotor'); qBox(T_I, [X - 2.1, 38, 12.4], [X + 2.1, 42, 16.6], MOTOR, { w: .9 });
+  sbPart('ybelt'); qBelt([X, 39.6, 17.3], [X, 2.6, 17.3], .65, .65, [1, 0, 0], '#2b2724', { w: 1.1 });
+  // ---- Y carriage, Z motor + lead screw, pen holder and pen
+  sbPart('ycarr'); qBox(T_I, [X + 1.3, py - 3, 10.6], [X + 1.9, py + 3, 17.8], ALU, { w: .8 }); qBox(T_I, [X - 1.3, py - 2.6, 16.6], [X + 1.9, py + 2.6, 17.8], ALU, { w: .7 });
+  sbPart('zmotor'); qBox(T_I, [px - 1.8, py - 1.8, 17.8], [px + 1.8, py + 1.8, 21], MOTOR, { w: .8 }); qBox(T_I, [X + 1.9, py - 1.8, 17.2], [px + 1.8, py + 1.8, 17.8], ALU, { w: .6 });
+  const zh = zt + 5;
+  sbPart('leadscrew'); qRod([px, py, 17.2], [px, py, 10.4], .3, STEEL, { w: .5 }); qHelix([px, py, 17], [px, py, 10.6], .34, 14, '#8f989b', { w: .45 });
+  sbPart('pen'); qBox(T_I, [X + 1.9, py - 1.5, zh], [px + 1.6, py + 1.5, zh + 1.8], m, { w: .8, sh: tone });
+  qRod([px, py, zh + 3], [px, py, zt + 1], .5, matOf('#3f7fc0'), { w: .8, sh: tone }); qRod([px, py, zt + 1], [px, py, zt], .5, DARK, { w: .7, r1: .12 });
+  // ---- controller case: board, three drivers, power supply
+  sbGroup('case', T_I, [8, 39, 3], [24, 45, 8]);
+  sbPart('psu'); qBox(T_I, [8.6, 39.6, 3], [13.6, 44.4, 6.4], ALU, { w: .8 });
+  sbPart('ctrl'); qBox(T_I, [14.4, 39.6, 3.4], [23.4, 44.4, 3.8], matOf('#2f6fb0'), { w: .7 }); qBox(T_I, [21.4, 41, 3.8], [23.4, 43, 4.6], STEEL, { w: .5 });
+  sbPart('drivers'); for (let k = 0; k < 3; k++){ qBox(T_I, [15 + k*2.1, 40.2, 3.8], [16.6 + k*2.1, 42.4, 4.3], PCB, { w: .5 }); qBox(T_I, [15.3 + k*2.1, 40.5, 4.3], [16.3 + k*2.1, 42, 5.2], ALU, { w: .4 }); }
+  sbPart('case'); qExt(T_I, rrUV(8, 39, 24, 45, 1), 3, 8, DARK, { ax: 'z', cover: true, w: 1.6, capDeco: b => b ? txT(T_I, [16, 42, 8.02], [1,0,0], [0,1,0], 'CNC-3', 1.6, '#f2efe7') + dotAt([22, 40.5, 8.02], .5, st.mode === 'op' ? '#43c25c' : '#8d877a', .3) : '' });
+  sbFree(); sbPart('cables'); qWire([[20, 39, 7], [20, 36, X > 30 ? 22 : 20], [X, 38.5, 19], [X, 38.5, 16.6]], '#3a3633', .4, { seg: 5 });
+  qWire([[17, 39, 7], [(17 + X)/2, 36.5, 9.5], [1.5, 37, 8.4]], '#3a3633', .3, { seg: 6 }); qWire([[16, 39, 6], [10, 22, 4.8], [2.9, 3, 4.2]], '#3a3633', .3, { seg: 6 });
+  // ---- ink on the paper and a ghost of where the controller believes the pen is
+  const floor = '';
+  let over = '';
+  if (st.mode === 'op' && (Math.abs(st.err[0]) > .05 || Math.abs(st.err[1]) > .05)){ const g = P(GT.X0 + st.p[0], GT.Y0 + st.p[1], 4.06), r = 1.2*INK_K*2;
+    over += `<g pointer-events="none"><circle cx="${f(g[0])}" cy="${f(g[1])}" r="${f(r)}" fill="none" stroke="#e2483d" stroke-width=".9" stroke-dasharray="1.2 1"/><path d="M${f(g[0]-r*1.4)} ${f(g[1])}H${f(g[0]+r*1.4)}M${f(g[0])} ${f(g[1]-r*1.4)}V${f(g[1]+r*1.4)}" stroke="#e2483d" stroke-width=".6"/></g>`; }
+  if (st.mode === 'op') over += tipHandle([px, py, zt], 4.05, false);
+  return { under: board(0, 0, 52, 47, 3, 6), z0: 3, clip: boardTop(0, 0, 52, 47, 3, 6), floor, over };
+}
+
+// motion: straight lines with an acceleration ramp; a stepper asked to go faster than it can slips and loses steps
+function gtTick(st, dt, ui, lab){
+  let goal = st.jog, cur = st.prog && st.prog[st.pc];
+  if (st.running && cur){ if (!st.segGoal){ const c = cur, g = st.p.slice();
+      if (c.x != null) g[0] = c.x/10; if (c.y != null) g[1] = c.y/10; if (c.z != null) g[2] = c.z/10;
+      st.segGoal = g; st.segV = c.code === 'G0' ? GT.RAPID : st.feed/10; }
+    goal = st.segGoal; }
+  if (!goal){ st.v = [0, 0, 0]; st.speed = 0; return false; }
+  const d = sub(goal, st.p), L = vLen(d), vmax = st.running ? st.segV : GT.RAPID;
+  if (L < 1e-4){ st.p = goal.slice(); st.speed = 0; st.v = [0, 0, 0];
+    if (st.running){ st.segGoal = null; st.pc++; if (st.pc >= st.prog.length){ st.running = false; lab.flash('Program done'); } }
+    else st.jog = null;
+    return true; }
+  const v = Math.min(vmax, st.speed + GT.ACC*dt, Math.sqrt(2*GT.ACC*L)), step = Math.min(L, v*dt), mv = vSc(d, step/L);
+  st.speed = v; st.v = vSc(mv, 1/dt);
+  // lost steps: above its pull-out speed a motor falls behind its pulses; the error never comes back
+  const stall = [GT.STALLX, GT.STALLY];
+  for (let k = 0; k < 2; k++){ const va = Math.abs(st.v[k]); if (va > stall[k]){ const e = Math.sign(st.v[k])*(va - stall[k])*dt*.35; st.err[k] += e; st.lost[k] += Math.abs(e)*10*gtSPmm(k, st.micro);
+      if (!st.slipT) lab.flash(`${'XY'[k]} motor is skipping steps: too fast for its torque`); st.slipT = 1.5; } }
+  if (st.slipT) st.slipT = Math.max(0, st.slipT - dt);
+  const was = st.p[2] <= .02; st.p = vAdd(st.p, mv); const down = st.p[2] <= .02;
+  const ap = [st.p[0] - st.err[0], st.p[1] - st.err[1]];
+  if (down){ if (!was || !st.ink.length) st.ink.push([ap]); else { const s = st.ink[st.ink.length - 1], l = s[s.length - 1]; if (Math.hypot(ap[0] - l[0], ap[1] - l[1]) > .15) s.push(ap); }
+    if (st.ink.length > 80) st.ink.shift(); }
+  return true;
+}
+const gtClampP = p => [clamp(p[0], 0, GT.XW), clamp(p[1], 0, GT.YW), clamp(p[2], 0, 1.6)];
+
+ROBOTS.gantry = {
+  id: 'gantry', fig: '08', name: 'CNC gantry plotter', pal: 'cobalt', kicker: '3 axes · steppers · belts + lead screw · G-code',
+  blurb: 'Linear rails, timing belts, a lead screw and three stepper motors: the Cartesian machine inside every 3D printer, laser cutter and CNC router. Run a G-code drawing and push the speed until the motors start skipping steps.',
+  size: [52, 47, 24], center: [26, 23.5], bounds: [2, 50, 2, 45, 0, 24],
+  init: () => ({ p: [0, 0, GT.PUP], err: [0, 0], lost: [0, 0], v: [0, 0, 0], speed: 0, jog: null, prog: gtProgram('square'), kind: 'square', pc: 0, running: false, segGoal: null, segV: 0,
+    feed: 80*60/60, micro: 16, ink: [], slipT: 0 }),
+  thumbState: { p: [18, 12, 0], ink: [[[12, 6], [24, 6], [24, 18], [12, 18], [12, 6]]] }, thumbYaw: 0,
+  steps: [
+    { title: 'Rails, feet & limit switches', parts: ['frame', 'endstops'], text: 'Two aluminium extrusion rails on steel feet. A red limit switch at the end of each axis tells the controller where zero is.' },
+    { title: 'Bed & paper', parts: ['bed', 'paper'], text: 'A flat MDF bed with the paper taped down: 360 × 240 mm of drawing area.' },
+    { title: 'X motors & belts', parts: ['xmotors', 'xbelts'], text: 'One stepper and one GT2 belt per rail. Both motors get the same step pulses, so both ends of the gantry move together and it cannot rack.' },
+    { title: 'Gantry beam', parts: ['gantry'], text: 'The beam rides both rails on wheeled carriages clamped to the belts. It is the heaviest moving part, so X has the lowest top speed.' },
+    { title: 'Y motor & belt', parts: ['ymotor', 'ybelt'], text: 'The Y stepper rides on the end of the beam; its belt runs along the beam’s top.' },
+    { title: 'Y carriage', parts: ['ycarr'], text: 'Slides along the beam, carrying the Z axis.' },
+    { title: 'Z motor & lead screw', parts: ['zmotor', 'leadscrew'], text: 'A small stepper turns an 8 mm-lead screw: slow, strong, and it does not back-drive, so the pen stays put with the power off.' },
+    { title: 'Pen holder & pen', parts: ['pen'], text: 'The holder rides the lead screw nut. Pen down is Z = 0, the paper.' },
+    { title: 'Controller, drivers & power', parts: ['ctrl', 'drivers', 'psu'], peek: true, text: 'The board turns G-code into step and direction pulses; each driver chops current through its motor’s two coils in sequence, with microstepping for smoothness.' },
+    { title: 'Case', parts: ['case'], text: 'A vented cover over the electronics; the drivers need airflow.' },
+    { title: 'Motor cables', parts: ['cables'], text: 'Four wires per stepper, one pair per coil. The Y and Z cables arc over to the moving gantry.' },
+  ],
+  parts: {
+    frame: { name: 'Rails & feet', kind: 'structure', lbl: 'RAILS', key: true, short: '20 × 40 extrusion', info: 'The rails define straightness: any bow in them shows up in every line drawn.', held: 'Steel feet on the bench' },
+    endstops: { name: 'Limit switches', kind: 'sensor', lbl: 'ENDSTOPS', short: 'home sensors', info: 'Steppers do not know where they are at power-up. Homing drives each axis slowly into its switch and calls that zero.', held: 'Rail ends and the beam end' },
+    bed: { name: 'Bed', kind: 'structure', short: 'MDF board', info: 'Flat and stiff; the pen needs a constant height.', held: 'The rails' },
+    paper: { name: 'Paper', kind: 'tool', lbl: 'PAPER', short: '360 × 240 mm', info: 'Origin (X0 Y0) is the front-left corner.', held: 'Tape' },
+    xmotors: { name: 'X steppers (×2)', kind: 'motor', lbl: 'X STEPPERS', key: true, short: 'NEMA 17, 200 steps/rev', info: 'A stepper has a toothed rotor and two coils; energising them in sequence pulls the rotor one 1.8 degree step at a time. Torque falls as speed rises.', held: 'Brackets at the rail ends', spec: '0.45 N m holding' },
+    xbelts: { name: 'X belts', kind: 'gear', lbl: 'X BELTS', short: 'GT2, 20-tooth pulleys', info: '20 teeth × 2 mm pitch = 40 mm of travel per motor turn: 200 full steps → 5 steps per mm.', held: 'Pulleys and the carriage clamps', spec: '40 mm/rev' },
+    gantry: { name: 'Gantry beam', kind: 'structure', lbl: 'GANTRY', key: true, short: 'moves in X', info: 'Moving mass about 1.5 kg. At 1.5 m/s² the X motors already pull hard.', held: 'Carriages on both rails' },
+    ymotor: { name: 'Y stepper', kind: 'motor', lbl: 'Y STEPPER', short: 'drives the carriage', info: 'Lighter load than X, so Y can go faster before skipping.', held: 'The beam end' },
+    ybelt: { name: 'Y belt', kind: 'gear', short: 'GT2 along the beam', info: 'Same 40 mm per turn as X.', held: 'Pulleys on the beam' },
+    ycarr: { name: 'Y carriage', kind: 'structure', lbl: 'Y CARRIAGE', short: 'moves in Y', info: 'Wheels either side of the beam hold it square.', held: 'The beam' },
+    zmotor: { name: 'Z stepper', kind: 'motor', lbl: 'Z STEPPER', short: 'small NEMA 14', info: 'Only lifts the pen holder.', held: 'The Y carriage' },
+    leadscrew: { name: 'Lead screw', kind: 'gear', lbl: 'LEAD SCREW', short: '8 mm per turn', info: '200 steps / 8 mm = 25 steps per mm: five times finer than the belts, but slower.', held: 'Coupler on the Z motor', spec: 'T8, 8 mm lead' },
+    pen: { name: 'Pen holder & pen', kind: 'tool', lbl: 'PEN', key: true, short: 'the tool', info: 'Swap it for a laser, a drag knife or a spindle and this is a laser cutter, a vinyl cutter or a CNC router.', held: 'The lead screw nut' },
+    ctrl: { name: 'Controller board', kind: 'electronics', lbl: 'CONTROLLER', inside: true, short: 'G-code interpreter', info: 'Plans each line with acceleration ramps, then emits step pulses at up to tens of thousands per second.', held: 'Standoffs in the case' },
+    drivers: { name: 'Stepper drivers (×3)', kind: 'electronics', lbl: 'DRIVERS', inside: true, short: 'current chopping, microstepping', info: 'Microstepping splits each step by setting the two coil currents to sine and cosine fractions. 16 microsteps: 80 steps per mm on the belts.', held: 'Sockets on the board' },
+    psu: { name: 'Power supply', kind: 'power', lbl: 'PSU', inside: true, short: '24 V, 5 A', info: 'Higher voltage lets current rise faster in the coils, so torque holds up better at speed.', held: 'The case floor' },
+    case: { name: 'Electronics case', kind: 'cover', lbl: 'CASE', key: true, short: 'vented cover', info: 'Status LED is green while it runs.', held: 'The bench' },
+    cables: { name: 'Motor cables', kind: 'wiring', short: '4-wire stepper cables', info: 'Two coils, two wires each.', held: 'Clips along the frame' },
+  },
+  concepts: [
+    ['Cartesian motion', 'One motor per axis, axes at right angles: X, Y and Z are simply motor positions times a constant. No inverse kinematics at all, which is why CNC machines and printers look like this.'],
+    ['G-code', 'G0 = move fast (rapid), G1 = cut or draw at the feed rate F, Z for pen height. The controller reads a line, plans a straight move with ramps, and moves on. The program list shows the line running now.'],
+    ['Steps per mm', 'Belts: 200 steps × microsteps / 40 mm. Lead screw: 200 × microsteps / 8 mm. More microsteps are smoother and finer, but not stronger.'],
+    ['Open loop and lost steps', 'The controller never measures position: it only counts pulses. Above a motor’s pull-out speed it slips, and every line after is offset (the red cross is where it thinks the pen is). Drop the feed, then press Home to re-zero on the switches.'],
+    ['Acceleration ramps', 'A stepper cannot jump to full speed. Each move ramps up and down at 1.5 m/s²; on short segments (the circle) it never reaches the feed rate.'],
+  ],
+  draw: gtDraw,
+  active: st => { const a = {}; if (Math.abs(st.v[0]) > .1) a.xmotors = a.xbelts = true; if (Math.abs(st.v[1]) > .1) a.ymotor = a.ybelt = true; if (Math.abs(st.v[2]) > .05) a.zmotor = a.leadscrew = true;
+    if (st.running) a.ctrl = a.drivers = true; return a; },
+  opHTML: () => `<div class="seg" id="gtprog">${['square', 'circle', 'star', 'spiral', 'grid'].map(k => `<button data-k="${k}">${k[0].toUpperCase() + k.slice(1)}</button>`).join('')}</div>
+    <div class="row2"><button id="gtrun">Run program</button><button id="gtpen">Pen down</button><button id="gthome">Home</button><button id="gtclr">New paper</button></div>
+    ${slHTML('gtfeed', 'Feed rate F', 10, 300, 5, ' mm/s')}
+    <div class="seg" id="gtmu">${GT_MICRO.map(u => `<button data-u="${u}">1/${u} step</button>`).join('')}</div>
+    <p class="note">Drag the yellow ring (or use the sliders) to jog; with the pen down it draws.</p>
+    ${slHTML('gtx', 'Jog X', 0, 360, 1, ' mm')}${slHTML('gty', 'Jog Y', 0, 240, 1, ' mm')}
+    <h3 style="margin-top:8px">Program</h3><pre id="gtcode" style="font-size:10.5px;line-height:1.45;margin:0;max-height:118px;overflow:hidden;background:#fff;border:1.2px solid var(--ink);border-radius:8px;padding:5px 8px"></pre>`,
+  opBind(el, st, ui, lab){ const $ = id => document.getElementById(id);
+    const jog = p => { if (st.running) return lab.flash('Program running — press Stop to jog'); st.jog = gtClampP(p); lab.kick(); };
+    el.querySelectorAll('#gtprog button').forEach(b => b.onclick = () => { if (st.running) return lab.flash('Stop the program first'); st.kind = b.dataset.k; st.prog = gtProgram(st.kind); st.pc = 0; ui.render(); });
+    el.querySelectorAll('#gtmu button').forEach(b => b.onclick = () => { st.micro = +b.dataset.u; ui.render(); });
+    $('gtrun').onclick = () => { if (st.running){ st.running = false; st.segGoal = null; ui.render(); return; } if (st.pc >= st.prog.length) st.pc = 0; st.jog = null; st.running = true; lab.kick(); ui.render(); };
+    $('gtpen').onclick = () => jog([st.p[0], st.p[1], st.p[2] > .02 ? 0 : GT.PUP]);
+    $('gthome').onclick = () => { if (st.running) return lab.flash('Stop the program first'); st.p = [st.p[0] - st.err[0], st.p[1] - st.err[1], st.p[2]]; st.err = [0, 0]; st.lost = [0, 0]; st.jog = [0, 0, GT.PUP]; lab.flash('Homing: each axis runs into its switch and resets to zero'); lab.kick(); };
+    $('gtclr').onclick = () => { st.ink = []; ui.render(); };
+    $('s_gtfeed').oninput = e => { st.feed = +e.target.value; ui.render(); };
+    $('s_gtx').oninput = e => jog([+e.target.value/10, (st.jog || st.p)[1], (st.jog || st.p)[2]]);
+    $('s_gty').oninput = e => jog([(st.jog || st.p)[0], +e.target.value/10, (st.jog || st.p)[2]]); },
+  opSync(el, st){ const $ = id => document.getElementById(id);
+    el.querySelectorAll('#gtprog button').forEach(b => b.setAttribute('aria-pressed', b.dataset.k === st.kind));
+    el.querySelectorAll('#gtmu button').forEach(b => b.setAttribute('aria-pressed', +b.dataset.u === st.micro));
+    $('gtrun').textContent = st.running ? 'Stop' : st.pc > 0 && st.pc < st.prog.length ? 'Resume' : 'Run program'; $('gtrun').setAttribute('aria-pressed', st.running);
+    $('gtpen').textContent = st.p[2] > .02 ? 'Pen down' : 'Pen up';
+    slSync('gtfeed', st.feed, `${st.feed} mm/s`, st.feed > GT.STALLX*10); slSync('gtx', (st.jog || st.p)[0]*10, `${(st.p[0]*10).toFixed(1)} mm`); slSync('gty', (st.jog || st.p)[1]*10, `${(st.p[1]*10).toFixed(1)} mm`);
+    const i0 = Math.max(0, Math.min(st.pc - 2, st.prog.length - 7));
+    $('gtcode').innerHTML = st.prog.slice(i0, i0 + 7).map((c, k) => { const i = i0 + k, cur = i === st.pc && st.pc < st.prog.length;
+      return `<div style="${cur ? 'background:var(--accent,#f4b829);font-weight:800;' : i < st.pc ? 'opacity:.45;' : ''}">${String(i + 1).padStart(3, ' ')}  ${c.txt}</div>`; }).join('') + `<div class="note">${st.prog.length} lines</div>`; },
+  readout(st){ const rows = [], spm = k => gtSPmm(k, st.micro);
+    ['X', 'Y', 'Z'].forEach((a, k) => rows.push({ k: `${a} ${(st.p[k]*10).toFixed(1)} mm`, bar: Math.abs(st.v[k])/GT.RAPID, v: `${Math.round(st.p[k]*10*spm(k))} steps`, tip: `${spm(k)} steps/mm` }));
+    rows.push({ k: 'Speed', bar: st.speed/30, v: `${(st.speed*10).toFixed(0)} mm/s` });
+    rows.push({ k: 'Step rate X', bar: Math.abs(st.v[0])*10*spm(0)/40000, v: `${(Math.abs(st.v[0])*10*spm(0)/1000).toFixed(1)} kHz` });
+    rows.push({ k: 'Resolution', v: `${(1/spm(0)*1000).toFixed(1)} µm (belts)` });
+    rows.push({ k: 'Lost steps X / Y', v: `${Math.round(st.lost[0])} / ${Math.round(st.lost[1])}`, warn: st.lost[0] + st.lost[1] > 0, tip: 'Steps sent that the motor never made' });
+    rows.push({ k: 'Position error', bar: Math.hypot(...st.err)/1, v: `${(Math.hypot(...st.err)*10).toFixed(1)} mm`, warn: Math.hypot(...st.err) > .05 });
+    rows.push({ k: 'Line', v: st.pc < st.prog.length ? `${st.pc + 1} / ${st.prog.length}` : 'done' });
+    return rows; },
+  stats: st => [{ label: 'Pen X Y mm', value: `${(st.p[0]*10).toFixed(0)} ${(st.p[1]*10).toFixed(0)}`, small: true }],
+  tick: gtTick,
+  enterOp: st => { st.jog = null; },
+  onDrag(st, dx, dy, phase, lab){ if (phase === 'start'){ if (st.running){ st.running = false; st.segGoal = null; lab.flash('Program paused: jogging by hand'); } st.dragP = st.p.slice(); return; } if (phase !== 'move') return;
+    const d = dragPlane(dx, dy); st.dragP = gtClampP([st.dragP[0] + d[0], st.dragP[1] + d[1], st.dragP[2]]); st.jog = st.dragP.slice(); },
+  params(st, q){ if (q.has('prog')){ st.kind = q.get('prog'); st.prog = gtProgram(st.kind); }
+    if (q.has('feed')) st.feed = +q.get('feed');
+    if (q.get('demo') === 'run'){ st.running = true; for (let k = 0; k < 6000 && st.running; k++) gtTick(st, 1/60, null, { flash(){} }); } },
+};
+ROBOT_ORDER.push({ id: 'gantry', name: 'CNC gantry plotter', blurb: 'Steppers, lead screw and timing belts on linear rails: run G-code drawings, change microstepping, and over-drive the motors until they lose steps.', chips: ['3 axes', 'Steppers', 'Lead screw + belts', 'G-code'] });
+
+/* ============================================================
+   Robot 09 — mobile manipulator (a differential-drive base with a 5-DOF arm). 1 unit = 1 cm.
+   Truth: a low, heavy base keeps the centre of mass between the wheels: two hub motors with encoders, front and rear
+   casters, a big battery low down, motor drivers and an onboard computer, a lidar at bumper height and an RGB-D camera
+   on a rear mast. The arm turret is bolted near the front edge. Joints use compact actuators (motor + strain-wave gear +
+   encoder in one housing). A camera on the wrist looks between the gripper fingers.
+   Whole-body: when the target is outside the arm's reach, the base drives to a spot where it is inside, turns to face it,
+   then the arm finishes the job. Base + arm = 3 + 5 DOF.
+   Parts: chassis | motors, wheels, casters | battery, drivers, pc | lidar | shell | mast, headcam | turret, j1 | j2, upper |
+          j3, fore | wrist | grip, wcam | harness | cube, bin
+   ============================================================ */
+const MM = { C: 60, R0: 58, TRACK: 30, RW: 6, VMAX: 45, WMAX: 1.6, AX: 9, SH: 31, L1: 24, L2: 22, W: 6, G: 8, RMIN: 20, RMAX: 40, STAND: 30 };
+const MM_LIM = [[-160, 160], [0, 175], [0, 165], [-110, 110], [-180, 180], [0, 1]];
+const MM_VMAX = [70, 50, 60, 90, 120, 1.5];
+const MM_NAMES = ['Arm yaw', 'Shoulder', 'Elbow', 'Wrist pitch', 'Wrist roll', 'Gripper'];
+const MM_STOW = [0, 95, 150, 40, 0, .7];
+const MM_BIN = { x: -30, y: 30, s: 9, h: 11 };
+const MM_CUBE = 2.6;
+
+const mmScene = (st, w) => [MM.C + w[0] - st.pos[0], MM.C + w[1] - st.pos[1]];
+const mmTR = st => tMul(tTr(MM.C, MM.C, 0), tRz(st.th));
+function mmFK(st, q){ const B = tCat(mmTR(st), tTr(MM.AX, 0, MM.SH)), Ty = tMul(B, tRz(q[0]*DEG)), Tu = tMul(Ty, tRy(-q[1]*DEG));
+  const Te = tCat(Tu, tTr(MM.L1, 0, 0), tRy(q[2]*DEG)), Tw = tCat(Te, tTr(MM.L2, 0, 0), tRy(q[3]*DEG)), Tr = tCat(Tw, tTr(MM.W, 0, 0), tRx(q[4]*DEG));
+  return { B, Ty, Tu, Te, Tw, Tr, E: tAp(Te, [0,0,0]), W: tAp(Tw, [0,0,0]), tip: tAp(Tr, [MM.G, 0, 0]) }; }
+// world point -> robot frame, measured from the arm's yaw axis
+function mmLocal(st, w){ const dx = w[0] - st.pos[0], dy = w[1] - st.pos[1], c = Math.cos(-st.th), s = Math.sin(-st.th);
+  return [dx*c - dy*s - MM.AX, dx*s + dy*c, (w[2] ?? 0) - MM.SH]; }
+// arm IK, tool pointing straight down; target in world coordinates
+function mmIK(st, w, grip){ const [x, y, z] = mmLocal(st, w), r = Math.hypot(x, y), yaw = Math.atan2(y, x)/DEG, wz = z + MM.W + MM.G, D = Math.hypot(r, wz);
+  if (D > MM.L1 + MM.L2 - .1) return { err: 'Out of the arm’s reach' }; if (D < Math.abs(MM.L1 - MM.L2) + 2) return { err: 'Too close to the shoulder' };
+  const a1 = Math.atan2(wz, r) + Math.acos(clamp((MM.L1**2 + D*D - MM.L2**2) / (2*MM.L1*D), -1, 1)), be = Math.atan2(wz - MM.L1*Math.sin(a1), r - MM.L1*Math.cos(a1));
+  const q = [yaw, a1/DEG, (a1 - be)/DEG, (be + Math.PI/2)/DEG, 0, grip];
+  for (let i = 0; i < 4; i++) if (q[i] < MM_LIM[i][0] || q[i] > MM_LIM[i][1]) return { err: `${MM_NAMES[i]} would pass its limit`, q };
+  return { q }; }
+// can the arm reach this world point without the base moving?
+function mmReachable(st, w){ const [x, y] = mmLocal(st, w), r = Math.hypot(x, y); return r >= MM.RMIN && r <= MM.RMAX && Math.abs(Math.atan2(y, x)/DEG) < 150; }
+function mmHit(px, py, st){ const b = MM_BIN, cx = clamp(px, b.x - b.s, b.x + b.s), cy = clamp(py, b.y - b.s, b.y + b.s);
+  if (Math.hypot(px - cx, py - cy) < 23) return 'the bin';
+  if (!st.held && !st.inBin && Math.hypot(px - st.cube[0], py - st.cube[1]) < 23) return 'the cube';
+  return null; }
+
+function mmDraw(st, m){
+  const TR = mmTR(st), F = mmFK(st, st.q), wheelsAt = ROBOTS.mobman._step.wheels;
+  if (st.mode === 'build' && st.built <= wheelsAt){ sbFree(); sbPut(qBoxNoPut(TR, [-8, -8, 0], [8, 8, 5], matOf('#c9bfa9')), obbT(TR, [-8, -8, 0], [8, 8, 5]), { p: null }); }
+  // ---- chassis, drive, casters
+  sbPart('chassis'); qBox(TR, [-21, -14, 5], [21, 14, 7], ALU, { w: 1.2 });
+  for (const s of [1, -1]){ const y = v => s*v, lo = (a, b) => Math.min(y(a), y(b)), hi = (a, b) => Math.max(y(a), y(b));
+    sbPart('motors'); qCyl(TR, 'y', [0, 6], y(9), y(13.4), 4.2, MOTOR, { w: 1 }); qBox(TR, [-3, lo(9, 12), 5], [3, hi(9, 12), 7], ALU, { w: .7 });
+    sbPart('wheels'); qCyl(TR, 'y', [0, 6], y(13.4), y(17), MM.RW, TYRE, { w: 1.4, n: 28 });
+    const out = tVec(TR, [0, s, 0]); qCyl(TR, 'y', [0, 6], y(17), y(17.3), 3, ALU, { w: .8, deco: () => vis(out) ? [0, 1, 2].map(k => { const a = st.wa[s > 0 ? 0 : 1] + k*2*Math.PI/3;
+      return line([tAp(TR, [0, y(17.32), 6]), tAp(TR, [2.6*Math.cos(a), y(17.32), 6 + 2.6*Math.sin(a)])], .7); }).join('') : '' }); }
+  sbPart('casters'); for (const x of [17, -17]){ qCyl(TR, 'z', [x, 0], 2.6, 5, 1.5, ALU, { w: .7 }); qBall(tAp(TR, [x, 0, 1.3]), 1.3, STEEL); }
+  // ---- inside the shell
+  sbGroup('shell', TR, [-21, -14, 7], [21, 14, 18]);
+  sbPart('battery'); qBox(TR, [-17, -7, 7], [-2, 7, 12], BATT, { w: 1, deco: n => n[2] === 1 ? txT(TR, [-9.5, 0, 12.02], [1,0,0], [0,1,0], '48V 20Ah', 1.8, '#fff') : '' });
+  sbPart('drivers'); qBox(TR, [0, -11, 7], [8, -4, 7.6], PCB, { w: .7 }); qBox(TR, [1, -10, 7.6], [7, -5, 10], ALU, { w: .7, deco: n => n[2] === 1 ? [2, 3.5, 5, 6.5].map(x => line([tAp(TR, [x, -9.6, 10.02]), tAp(TR, [x, -5.4, 10.02])], .5)).join('') : '' });
+  sbPart('pc'); qBox(TR, [0, 3, 7], [11, 11, 10.5], DARK, { w: .9, deco: n => n[2] === 1 ? txT(TR, [5.5, 7, 10.52], [1,0,0], [0,1,0], 'COMPUTE', 1.3, '#93d3b0') : '' });
+  sbPart('harness'); qWire([[-3, 0, 10], [1, -4, 9.5], [4, -7, 10]].map(p => tAp(TR, p)), CABLE.pwr, .4); qWire([[5, 3, 9], [8, 1, 13], [MM.AX, 0, 17.5]].map(p => tAp(TR, p)), CABLE.sig, .35);
+  sbPart('shell'); qExt(TR, rrUV(-21, -14, 21, 14, 5), 7, 18, m, { ax: 'z', cover: true, w: 2.2, capDeco: b => b ? txT(TR, [-6, 0, 18.02], [0,-1,0], [1,0,0], 'MOMA-8', 3) : '' });
+  sbFree(); sbPart('lidar'); qRod(tAp(TR, [19, 0, 12]), tAp(TR, [19, 0, 15]), 2.6, DARK, { w: 1, sh: tone });
+  qBox(TR, [21, -9, 8], [21.6, 9, 11], matOf('#ef6a4c'), { w: .8, sh: tone });
+  // ---- mast with the head camera
+  sbPart('mast'); qBox(TR, [-17, -1.2, 18], [-14.6, 1.2, 46], ALU, { w: .9 });
+  sbPart('headcam'); const Hc = tCat(TR, tTr(-15.8, 0, 47.5), tRz(st.cam), tRy(28*DEG)); qBox(Hc, [-2, -6, -1.6], [2.4, 6, 1.6], DARK, { w: 1, sh: tone,
+    deco: n => n[0] === 1 ? [-3.6, 0, 3.6].map(y => dotAt(tAp(Hc, [2.42, y, 0]), y ? .55 : .8, y ? '#3a3633' : '#5a82c6', .35)).join('') : '' });
+  // ---- arm: turret + J1 actuator, shoulder, upper arm, elbow, forearm, wrist, gripper with camera
+  sbPart('turret'); qRod(tAp(TR, [MM.AX, 0, 18]), tAp(TR, [MM.AX, 0, 20]), 6, STEEL, { w: 1.1 });
+  sbPart('j1'); qRod(tAp(TR, [MM.AX, 0, 20]), tAp(TR, [MM.AX, 0, 25]), 4.6, MOTOR, { w: 1.1, sh: tone });
+  qCyl(F.Ty, 'z', [0, 0], -6, -3.4, 4.2, m, { w: 1, sh: tone }); for (const y of [-4.6, 3.4]) qBox(F.Ty, [-3.4, y, -3.4], [3.4, y + 1.2, 1], m, { w: .9, sh: tone });
+  sbPart('j2'); qCyl(F.Ty, 'y', [0, 0], -3.4, 3.4, 3.6, MOTOR, { w: 1.1, sh: tone });
+  sbPart('upper'); qExt(F.Tu, rrUV(-2.4, -2, 2.4, 2, 1.2), 3, MM.L1 - 3, m, { w: 1.6 });
+  sbPart('j3'); qCyl(F.Tu, 'y', [MM.L1, 0], -3, 3, 3.1, MOTOR, { w: 1, sh: tone });
+  sbPart('fore'); qExt(F.Te, rrUV(-2, -1.7, 2, 1.7, 1), 2.8, MM.L2 - 2.4, m, { w: 1.4 });
+  sbPart('wrist'); qCyl(F.Te, 'y', [MM.L2, 0], -2.4, 2.4, 2.4, MOTOR, { w: .9, sh: tone }); qCyl(F.Tw, 'x', [0, 0], 2.2, MM.W, 2, MOTOR, { w: .9, sh: tone });
+  sbPart('grip'); const gap = 1 + st.q[5]*6;
+  qBox(F.Tr, [0, -3, -1.6], [1.4, 3, 1.6], ALU, { w: .8 });
+  for (const s of [1, -1]){ const y0 = s*gap/2, y1 = s*(gap/2 + .6); qBox(F.Tr, [1.4, Math.min(y0, y1), -1.2], [MM.G + .4, Math.max(y0, y1), 1.2], DARK, { w: .8 }); }
+  sbPart('wcam'); qBox(F.Tr, [.2, -1.2, 1.6], [2.6, 1.2, 3], DARK, { w: .7, deco: n => n[0] === 1 ? dotAt(tAp(F.Tr, [2.62, 0, 2.3]), .45, '#5a82c6', .3) : '' });
+  sbPart('harness'); qWire([tAp(F.Ty, [-3, 3.8, -1]), tAp(F.Tu, [6, 2.4, 2.2]), tAp(F.Tu, [MM.L1 - 4, 2.4, 2.2])], '#3a3633', .35, { seg: 4 });
+  qWire([tAp(F.Tu, [MM.L1 + 1, 3.1, 2]), tAp(F.Te, [5, 2, 1.8]), tAp(F.Te, [MM.L2 - 3, 2, 1.8])], '#3a3633', .3, { seg: 4 });
+  // ---- world: the cube and the bin
+  sbFree(); sbPart('cube'); const s = MM_CUBE;
+  if (st.held) qBox(tMul(F.Tr, tTr(MM.G - 2.4, 0, 0)), [-s, -s, -s], [s, s, s], matOf('#f4b829'), { w: 1, sh: tone });
+  else { const [cx, cy] = mmScene(st, st.cube); if (Math.hypot(cx - MM.C, cy - MM.C) < MM.R0 - 3) qBox(tMul(tTr(cx, cy, st.cube[2] + s), tRz(st.cube[3] || 0)), [-s, -s, -s], [s, s, s], matOf('#f4b829'), { w: 1, sh: tone }); }
+  sbPart('bin'); { const [bx, by] = mmScene(st, [MM_BIN.x, MM_BIN.y]), b = MM_BIN, far = Math.hypot(bx - MM.C, by - MM.C);
+    if (far < MM.R0 - b.s*1.5){ const M = matOf('#71b693'); qBox(T_I, [bx - b.s, by - b.s, 0], [bx + b.s, by + b.s, .8], M, { w: .9 });
+      for (const [lo, hi] of [[[bx - b.s, by - b.s, .8], [bx + b.s, by - b.s + .8, b.h]], [[bx - b.s, by + b.s - .8, .8], [bx + b.s, by + b.s, b.h]], [[bx - b.s, by - b.s + .8, .8], [bx - b.s + .8, by + b.s - .8, b.h]], [[bx + b.s - .8, by - b.s + .8, .8], [bx + b.s, by + b.s - .8, b.h]]]) qBox(T_I, lo, hi, M, { w: .9, sh: tone });
+      if (st.binN) sbPut(txT(T_I, [bx, by - b.s - .05, b.h*.55], [1,0,0], [0,0,1], String(st.binN), 3.2), obbW([bx - 2, by - b.s - .1, 3], [bx + 2, by - b.s, 8]), { p: 'bin' }); } }
+  // ---- floor: reach ring around the arm, path, trail, target marker
+  const rim = on(PZ(0), ellUV(MM.C, MM.C, MM.R0, MM.R0, 64)); let floor = '', over = '';
+  if (st.mode === 'op'){ const ax = tAp(TR, [MM.AX, 0, 0]), ring = r => `<path d="${pd(on(PZ(.05), ellUV(ax[0], ax[1], r, r, 60)))}" fill="none" stroke="#3d5878" stroke-width=".7" stroke-dasharray="1.6 1.2"/>`;
+    floor += clipTo(rim, ring(MM.RMIN) + ring(MM.RMAX) + trailSVG(st.trail.map(w => [...mmScene(st, w), .05]), '#e2483d', 1));
+    if (st.goalW){ const [gx, gy] = mmScene(st, st.goalW); floor += clipTo(rim, `<path d="${pd(on(PZ(.06), ellUV(gx, gy, 2, 2, 16)))}" fill="#e2483d" fill-opacity=".3" stroke="#e2483d" stroke-width=".8"/>`); }
+    if (!st.held && !st.inBin){ const [cx, cy] = mmScene(st, st.cube), c0 = tAp(Hc, [2.4, 0, 0]), q0 = P(...c0), q1 = P(cx, cy, 2.6);
+      over += `<path d="M${f(q0[0])} ${f(q0[1])}L${f(q1[0])} ${f(q1[1])}" stroke="#5a82c6" stroke-width=".7" stroke-dasharray="1.4 1.2" opacity=".7" pointer-events="none"/>`; }
+    if (st.crash) over += crashBurst(st.crash.at, st.crash.t); }
+  return { under: floorDisc(MM.C, MM.C, MM.R0, st.pos[0], st.pos[1]), z0: 0, clip: rim, floor, over };
+}
+
+// ---- task planner: base go-to, turn-to-face, arm moves and gripper actions, run in order
+function mmPlan(st, kind, lab){
+  if (st.inBin && kind !== 'stow') return lab.flash('The cube is in the bin — press New cube');
+  const P = [], c = st.cube, B = [MM_BIN.x, MM_BIN.y];
+  const visit = (pt) => { if (mmReachable(st, [pt[0], pt[1]]) && !P.length) return;
+    const dx = pt[0] - st.pos[0], dy = pt[1] - st.pos[1], d = Math.hypot(dx, dy), u = [dx/d, dy/d];
+    P.push({ ph: 'drive', to: [pt[0] - u[0]*(MM.STAND + MM.AX), pt[1] - u[1]*(MM.STAND + MM.AX)], face: pt }); };
+  if (!st.held && (kind === 'reach' || kind === 'fetch')){ visit(c);
+    P.push({ ph: 'arm', w: [c[0], c[1], c[2] + MM_CUBE + 9], grip: 1 }, { ph: 'arm', w: [c[0], c[1], c[2] + MM_CUBE], grip: 1 }, { ph: 'grip', grip: 0 }, { ph: 'q', q: MM_STOW, keep: true }); }
+  if (kind === 'fetch' || (kind === 'reach' && st.held)){ P.push({ ph: 'q', q: MM_STOW, keep: true }); P.push({ ph: 'drive', to: null, face: B, bin: true });
+    P.push({ ph: 'arm', w: [B[0], B[1], MM_BIN.h + MM_CUBE + 6], grip: null }, { ph: 'grip', grip: 1 }, { ph: 'q', q: MM_STOW }); }
+  if (kind === 'stow') P.push({ ph: 'q', q: MM_STOW, keep: true });
+  st.task = P; st.taskT = 0; lab.flash(kind === 'stow' ? 'Stowing the arm' : P[0] && P[0].ph === 'drive' ? 'Out of the arm’s reach: the base drives first' : 'In reach: the arm alone does it'); }
+function mmTick(st, dt, ui, lab){
+  const j = st.joy || [0, 0], manual = Math.hypot(j[0], j[1]) > .05; let vC = 0, wC = 0, armBusy = false;
+  if (manual && st.task){ st.task = null; st.goalW = null; lab.flash('Task cancelled: manual driving'); }
+  if (manual){ vC = j[1]*MM.VMAX; wC = -j[0]*MM.WMAX; }
+  const T = st.task && st.task[0];
+  if (T){ st.taskT += dt;
+    if (T.ph === 'drive'){ if (T.bin && !T.to){ const dx = T.face[0] - st.pos[0], dy = T.face[1] - st.pos[1], d = Math.hypot(dx, dy), u = [dx/d, dy/d]; T.to = [T.face[0] - u[0]*(MM.STAND + MM.AX), T.face[1] - u[1]*(MM.STAND + MM.AX)]; }
+      st.goalW = T.to; const dx = T.to[0] - st.pos[0], dy = T.to[1] - st.pos[1], dist = Math.hypot(dx, dy);
+      if (dist > 2.5){ const e = wrap180((Math.atan2(dy, dx) - st.th)/DEG)*DEG; wC = clamp(3*e, -MM.WMAX, MM.WMAX); vC = MM.VMAX*.8*Math.max(0, Math.cos(e))*Math.min(1, dist/15); }
+      else { const ef = wrap180((Math.atan2(T.face[1] - st.pos[1], T.face[0] - st.pos[0]) - st.th)/DEG); wC = clamp(3*ef*DEG, -MM.WMAX, MM.WMAX);
+        if (Math.abs(ef) < 2 && Math.abs(st.w) < .1){ st.task.shift(); st.goalW = null; } } }
+    else if (T.ph === 'arm'){ if (!T.started){ T.started = true; const r = mmIK(st, T.w, T.grip ?? st.q[5]);
+        if (r.err){ st.task = null; lab.flash(r.err + ' — task stopped'); } else st.qt = r.q; } armBusy = true; }
+    else if (T.ph === 'q'){ if (!T.started){ T.started = true; st.qt = [...T.q.slice(0, 5), T.keep ? st.qt[5] : T.q[5]]; } armBusy = true; }
+    else if (T.ph === 'grip'){ if (!T.started){ T.started = true; st.qt = [...st.qt.slice(0, 5), T.grip]; } armBusy = true; } }
+  // base dynamics: acceleration limits, wheel speeds, collisions
+  const dv = clamp(vC - st.v, -60*dt, 60*dt), dw = clamp(wC - st.w, -3*dt, 3*dt); st.v += dv; st.w += dw;
+  const np = [st.pos[0] + st.v*Math.cos(st.th)*dt, st.pos[1] + st.v*Math.sin(st.th)*dt], nth = st.th + st.w*dt, hit = mmHit(np[0], np[1], st);
+  if (hit && (Math.abs(st.v) > .01)){ st.v = st.w = 0; st.task = null; st.goalW = null; st.crashes++; st.crash = { at: tAp(mmTR(st), [22, 0, 8]), t: 1 }; lab.flash(`Bump: the base hit ${hit}`); }
+  else { st.pos = np; st.th = nth; }
+  st.wa[0] -= (st.v - st.w*MM.TRACK/2)/MM.RW*dt; st.wa[1] -= (st.v + st.w*MM.TRACK/2)/MM.RW*dt; st.dist += Math.abs(st.v*dt);
+  const l = st.trail[st.trail.length - 1]; if (!l || Math.hypot(l[0] - st.pos[0], l[1] - st.pos[1]) > 1.5){ st.trail.push(st.pos.slice()); if (st.trail.length > 300) st.trail.shift(); }
+  // head camera turns toward the cube
+  const tc = st.held || st.inBin ? 0 : wrap180((Math.atan2(st.cube[1] - st.pos[1], st.cube[0] - st.pos[0]) - st.th)/DEG)*DEG; st.cam += clamp(tc - st.cam, -2*dt, 2*dt);
+  // arm joints
+  let moving = false; const nq = st.q.slice();
+  for (let i = 0; i < 6; i++){ const d = st.qt[i] - st.q[i]; if (Math.abs(d) > 1e-4){ nq[i] += Math.sign(d)*Math.min(Math.abs(d), MM_VMAX[i]*dt); moving = true; } }
+  if (st.held && nq[5] < .45) nq[5] = .45;
+  moving = nq.some((v, i) => Math.abs(v - st.q[i]) > 1e-6);
+  st.qd = nq.map((v, i) => (v - st.q[i]) / Math.max(dt, 1e-3)); st.q = nq;
+  const F = mmFK(st, st.q), tipW = [F.tip[0] - MM.C + st.pos[0], F.tip[1] - MM.C + st.pos[1], F.tip[2]];
+  if (F.tip[2] < .5 || F.W[2] < 2){ st.qt = st.q.slice(); }
+  if (!st.held && !st.inBin && st.q[5] < .55 && st.qd[5] < 0 && Math.hypot(tipW[0] - st.cube[0], tipW[1] - st.cube[1]) < 2 && Math.abs(tipW[2] - st.cube[2] - MM_CUBE) < 2){ st.held = true; lab.flash('Cube gripped'); }
+  if (st.held && st.qt[5] > .6){ st.held = false; const b = MM_BIN, inB = Math.abs(tipW[0] - b.x) < b.s - 2 && Math.abs(tipW[1] - b.y) < b.s - 2;
+    st.cube = [tipW[0], tipW[1], inB ? .8 : 0, st.th + st.q[0]*DEG]; if (inB){ st.inBin = true; st.binN++; lab.flash('Delivered to the bin'); } else lab.flash('Cube put down'); }
+  if (armBusy && !moving && st.task && st.task[0] && st.task[0].started){ st.task.shift(); if (!st.task.length){ st.task = null; } }
+  if (st.task && !st.task.length) st.task = null;
+  if (st.crash){ st.crash.t -= dt/1.2; if (st.crash.t <= 0) st.crash = null; }
+  return manual || !!st.task || moving || Math.abs(st.v) > .05 || Math.abs(st.w) > .005 || !!st.crash || Math.abs(tc - st.cam) > .01;
+}
+const mmNewCube = st => { const a = Math.random()*2*Math.PI, r = 45 + Math.random()*40; let c = [st.pos[0] + r*Math.cos(a), st.pos[1] + r*Math.sin(a)];
+  if (Math.hypot(c[0] - MM_BIN.x, c[1] - MM_BIN.y) < 30) c = [st.pos[0] + 55, st.pos[1] - 20]; st.cube = [c[0], c[1], 0, a]; st.inBin = false; st.held = false; };
+
+ROBOTS.mobman = {
+  id: 'mobman', fig: '09', name: 'Mobile manipulator', pal: 'tomato', kicker: 'diff-drive base + 5-DOF arm · whole-body reach',
+  blurb: 'A rover with an arm on top. When the cube is out of the arm’s reach the base drives to it, turns to face it and parks; then the arm picks it. Fetch carries it to the bin.',
+  size: [120, 120, 66], center: [60, 60], bounds: [20, 100, 20, 100, 0, 62],
+  init: () => ({ pos: [0, 0], th: 0, v: 0, w: 0, wa: [0, 0], joy: [0, 0], dist: 0, trail: [], cam: 0, q: MM_STOW.slice(), qt: MM_STOW.slice(), qd: [0,0,0,0,0,0],
+    cube: [30, -42, 0, .3], held: false, inBin: false, binN: 0, task: null, taskT: 0, goalW: null, crash: null, crashes: 0 }),
+  thumbYaw: 0, thumbState: { q: [-20, 70, 100, 30, 0, .7], cube: [36, -6, 0, .3] },
+  steps: [
+    { title: 'Chassis', parts: ['chassis'], text: 'A thick aluminium plate. It sits on a stand until the wheels go on.' },
+    { title: 'Hub motors, wheels & casters', parts: ['motors', 'wheels', 'casters'], text: 'Two brushless hub motors with encoders drive the wheels; casters front and back keep it level. Track 300 mm.' },
+    { title: 'Battery, drivers & computer', parts: ['battery', 'drivers', 'pc'], peek: true, text: 'A 48 V pack sits low and central so the base stays stable when the arm reaches out. Motor drivers for the wheels, and a GPU computer that runs perception and planning.' },
+    { title: 'Lidar & bumper', parts: ['lidar'], text: 'A 2D lidar at the front for mapping and obstacle detection, behind a soft bumper strip.' },
+    { title: 'Shell', parts: ['shell'], text: 'A moulded cover with the arm turret opening near the front.' },
+    { title: 'Mast & head camera', parts: ['mast', 'headcam'], text: 'An RGB-D camera (colour + depth) high on a rear mast sees the floor ahead and finds the cube. It turns to keep the cube in view.' },
+    { title: 'Turret & J1 actuator', parts: ['turret', 'j1'], text: 'The arm’s yaw joint, bolted near the front edge so the arm reaches past the bumper.' },
+    { title: 'Shoulder & upper arm', parts: ['j2', 'upper'], text: 'The shoulder actuator: motor, strain-wave gear and encoder in one housing. 240 mm upper arm.' },
+    { title: 'Elbow & forearm', parts: ['j3', 'fore'], text: 'The elbow actuator and a 220 mm forearm.' },
+    { title: 'Wrist', parts: ['wrist'], text: 'Wrist pitch and wrist roll actuators: five arm joints in all.' },
+    { title: 'Gripper & wrist camera', parts: ['grip', 'wcam'], text: 'Parallel jaws, with a small camera on top for the last few centimetres of the approach.' },
+    { title: 'Arm harness', parts: ['harness'], text: 'Power and an EtherCAT bus daisy-chained through the actuators.' },
+    { title: 'Cube & bin', parts: ['cube', 'bin'], text: 'A cube on the floor and a bin to deliver it to. In Operate, press Fetch.' },
+  ],
+  parts: {
+    chassis: { name: 'Chassis', kind: 'structure', lbl: 'CHASSIS', key: true, short: '420 × 280 mm plate', info: 'A wide, heavy base: when the arm reaches out with a load, the centre of mass must stay inside the wheel and caster footprint.', held: 'Wheels and casters' },
+    motors: { name: 'Hub motors', kind: 'motor', lbl: 'HUB MOTORS', key: true, short: 'brushless, encoders', info: 'Motors built into the wheel hubs: no gearbox to wear out, and quiet.', held: 'Brackets under the chassis' },
+    wheels: { name: 'Drive wheels', kind: 'structure', lbl: 'WHEELS', short: '120 mm', info: 'Differential drive: steer by speed difference, cannot slide sideways.', held: 'The hub motors' },
+    casters: { name: 'Casters', kind: 'structure', short: 'front and rear', info: 'Two casters: the base is stable whichever way the arm leans.', held: 'Under the chassis' },
+    battery: { name: 'Battery', kind: 'power', lbl: 'BATTERY', inside: true, short: '48 V, 1 kWh', info: 'Heavy on purpose, and low: it is the counterweight for the arm.', held: 'Straps on the chassis' },
+    drivers: { name: 'Wheel drivers', kind: 'electronics', lbl: 'DRIVERS', inside: true, short: 'field-oriented control', info: 'Three-phase inverters running speed loops for each hub motor.', held: 'The chassis' },
+    pc: { name: 'Onboard computer', kind: 'electronics', lbl: 'COMPUTER', inside: true, short: 'perception + planning', info: 'Finds the cube in the camera images, plans where to park, solves the arm IK and sequences the task.', held: 'The chassis' },
+    lidar: { name: 'Lidar & bumper', kind: 'sensor', lbl: 'LIDAR', short: '2D scanner at the front', info: 'Keeps the base from driving into things it cannot see from the mast.', held: 'Front of the chassis' },
+    shell: { name: 'Shell', kind: 'cover', lbl: 'SHELL', key: true, short: 'cover', info: 'See-through shows the battery, drivers and computer.', held: 'Screws to the chassis' },
+    mast: { name: 'Mast', kind: 'structure', short: 'camera mount', info: 'High up so the camera looks down on the floor ahead.', held: 'Rear of the chassis' },
+    headcam: { name: 'Head RGB-D camera', kind: 'sensor', lbl: 'HEAD CAMERA', key: true, short: 'colour + depth', info: 'Depth comes from projected infrared dots seen by two cameras. The dashed blue line shows what it is looking at.', held: 'Pan joint on the mast' },
+    turret: { name: 'Arm turret', kind: 'structure', short: 'arm mount', info: 'Bolted through the shell to the chassis.', held: 'The chassis' },
+    j1: { name: 'J1 yaw actuator', kind: 'motor', lbl: 'J1', short: 'arm yaw', info: 'Swings the arm left and right; with the base turning too, yaw is redundant.', held: 'The turret' },
+    j2: { name: 'J2 shoulder actuator', kind: 'motor', lbl: 'SHOULDER', short: 'highest torque', info: 'Motor + strain-wave gear + encoder + brake in one housing.', held: 'The J1 bracket' },
+    upper: { name: 'Upper arm', kind: 'structure', lbl: 'UPPER ARM', short: '240 mm', info: 'Carbon tube with aluminium end fittings.', held: 'The shoulder actuator', spec: 'L1 = 240 mm' },
+    j3: { name: 'J3 elbow actuator', kind: 'motor', lbl: 'ELBOW', short: 'elbow', info: 'Smaller than the shoulder: less load out here.', held: 'The end of the upper arm' },
+    fore: { name: 'Forearm', kind: 'structure', lbl: 'FOREARM', short: '220 mm', info: 'Arm reach on its own: 200 to 400 mm from the yaw axis (the dashed rings).', held: 'The elbow actuator', spec: 'L2 = 220 mm' },
+    wrist: { name: 'Wrist actuators', kind: 'motor', lbl: 'WRIST', short: 'pitch + roll', info: 'Keeps the gripper pointing straight down while the arm moves.', held: 'The forearm' },
+    grip: { name: 'Gripper', kind: 'tool', lbl: 'GRIPPER', key: true, short: 'parallel jaws', info: 'Opens to 70 mm.', held: 'The wrist roll flange' },
+    wcam: { name: 'Wrist camera', kind: 'sensor', short: 'close-up view', info: 'Corrects the last few millimetres of error that the head camera and the base odometry leave.', held: 'Top of the gripper' },
+    harness: { name: 'Harness', kind: 'wiring', short: 'power + EtherCAT', info: 'One bus cable chains every actuator.', held: 'Clips along the arm' },
+    cube: { shadow: 'cube', name: 'Cube', kind: 'tool', short: '52 mm', info: 'Click the floor in Operate to move it.', held: 'The floor' },
+    bin: { shadow: 'bin', name: 'Bin', kind: 'structure', short: 'delivery target', info: 'Count of delivered cubes on its side.', held: 'The floor' },
+  },
+  concepts: [
+    ['Why put an arm on wheels?', 'A fixed arm’s workspace is a hollow sphere around its base. Wheels move that sphere anywhere on the floor. The dashed rings are the arm’s reach right now; anything outside them needs the base.'],
+    ['Whole-body planning', 'Plan where to park so the target lands inside the reach rings, turn to face it, then let the arm finish. Real systems also move base and arm at the same time; here they take turns, which is easier to follow.'],
+    ['Redundancy', 'Base yaw and arm yaw both turn the gripper about a vertical axis: 8 DOF for a 3D point + gripper angle. The planner uses the base to aim and keeps arm yaw near zero, the most stable pose.'],
+    ['Nonholonomic base', 'The base cannot slide sideways, so parking beside the cube means turning first. Try clicking the floor right next to the robot and pressing Reach.'],
+    ['Stability', 'Reaching out with a load moves the centre of mass forward. A heavy, low battery and front and rear casters keep it from tipping.'],
+  ],
+  draw: mmDraw,
+  active: st => { const a = {}; if (Math.abs(st.v) > .5 || Math.abs(st.w) > .02) a.motors = a.wheels = a.drivers = true;
+    const nm = ['j1', 'j2', 'j3', 'wrist', 'wrist', 'grip']; st.qd.forEach((v, i) => { if (Math.abs(v) > .5) a[nm[i]] = true; }); if (st.task) a.pc = true; return a; },
+  opHTML: () => `<div class="row2"><button id="mmfetch">Fetch to bin</button><button id="mmreach">Reach cube</button><button id="mmstow">Stow arm</button><button id="mmnew">New cube</button></div>
+    <div class="joyw"><div class="joy" id="mmjoy"><i></i></div><small>Drive the base by hand (or W A S D).<br>Click the floor to move the cube there.</small></div>
+    ${MM_NAMES.map((n, i) => slHTML('mm' + i, n, i === 5 ? 0 : MM_LIM[i][0], i === 5 ? 100 : MM_LIM[i][1], 1, i === 5 ? '%' : '°')).join('')}`,
+  opBind(el, st, ui, lab){ const $ = id => document.getElementById(id);
+    joyBind($('mmjoy'), st, lab);
+    for (let i = 0; i < 6; i++) $('s_mm' + i).oninput = e => { st.task = null; st.qt[i] = i === 5 ? +e.target.value/100 : +e.target.value; lab.kick(); };
+    $('mmfetch').onclick = () => { mmPlan(st, 'fetch', lab); lab.kick(); ui.render(); };
+    $('mmreach').onclick = () => { mmPlan(st, 'reach', lab); lab.kick(); ui.render(); };
+    $('mmstow').onclick = () => { mmPlan(st, 'stow', lab); lab.kick(); };
+    $('mmnew').onclick = () => { st.task = null; mmNewCube(st); lab.kick(); ui.render(); }; },
+  opSync(el, st){ for (let i = 0; i < 6; i++) slSync('mm' + i, i === 5 ? st.qt[5]*100 : st.qt[i], i === 5 ? `${((1 + st.q[5]*6)*10).toFixed(0)} mm` : `${st.q[i].toFixed(0)}°`); },
+  readout(st){ const L = mmLocal(st, [st.cube[0], st.cube[1], 0]), r = Math.hypot(L[0], L[1]), reach = mmReachable(st, st.cube), F = mmFK(st, st.q), rows = [];
+    rows.push({ k: 'Base speed', bar: Math.abs(st.v)/MM.VMAX, v: `${st.v.toFixed(0)} cm/s` });
+    rows.push({ k: 'Base turn', bar: Math.abs(st.w)/MM.WMAX, v: `${(st.w/DEG).toFixed(0)}°/s` });
+    rows.push({ k: 'Base pose', v: `${(st.pos[0]*10).toFixed(0)}, ${(st.pos[1]*10).toFixed(0)} mm, ${(((st.th/DEG) % 360 + 360) % 360).toFixed(0)}°` });
+    MM_NAMES.slice(0, 4).forEach((n, i) => rows.push({ k: n, bar: Math.abs(st.qd[i])/MM_VMAX[i], v: `${st.q[i].toFixed(0)}°` }));
+    rows.push({ k: 'Cube from arm axis', bar: r/80, v: st.held ? 'held' : st.inBin ? 'in the bin' : `${(r*10).toFixed(0)} mm`, warn: !st.held && !st.inBin && !reach, tip: 'Arm alone reaches 200–400 mm, in front' });
+    rows.push({ k: 'Who does it', v: st.held || st.inBin ? '—' : reach ? 'arm alone' : 'base + arm' });
+    rows.push({ k: 'Gripper height', v: `${(F.tip[2]*10).toFixed(0)} mm` });
+    rows.push({ k: 'Task', v: st.task && st.task[0] ? { drive: 'driving', arm: 'arm moving', q: 'arm moving', grip: 'gripper' }[st.task[0].ph] + ` (${st.task.length} steps left)` : 'idle' });
+    rows.push({ k: 'Delivered / bumps', v: `${st.binN} / ${st.crashes}`, warn: !!st.crash });
+    return rows; },
+  stats: st => [{ label: 'Cubes delivered', value: String(st.binN), small: true }],
+  tick: mmTick,
+  enterOp: st => { st.qt = st.q.slice(); },
+  onFloor(st, x, y, lab){ if (Math.hypot(x - MM.C, y - MM.C) > MM.R0 - 3) return; if (st.held) return lab.flash('Put the cube down first');
+    const w = [x - MM.C + st.pos[0], y - MM.C + st.pos[1]];
+    if (Math.hypot(w[0] - st.pos[0], w[1] - st.pos[1]) < 24) return lab.flash('That spot is under the robot');
+    if (Math.hypot(w[0] - MM_BIN.x, w[1] - MM_BIN.y) < 16) return lab.flash('That spot is in the bin');
+    st.task = null; st.cube = [w[0], w[1], 0, 0]; st.inBin = false; lab.flash(mmReachable(st, st.cube) ? 'Cube moved: in the arm’s reach' : 'Cube moved: out of reach, the base will have to drive', 1200); },
+  params(st, q){ if (q.has('cube')){ const v = q.get('cube').split(',').map(Number); st.cube = [v[0], v[1], 0, 0]; }
+    if (q.has('q')){ const v = q.get('q').split(',').map(Number); if (v.length === 6){ st.q = v.slice(); st.qt = v.slice(); } } },
+};
+ROBOT_ORDER.push({ id: 'mobman', name: 'Mobile manipulator', blurb: 'The rover with an arm on top: when the cube is out of reach the base drives and parks, then the arm picks it and carries it to the bin.', chips: ['Base + arm', '8 DOF', 'Whole-body'] });
+
+/* ============================================================
+   Robot 10 — humanoid upper body on a stand (two 4-DOF arms, 2-DOF neck, stereo camera head). 1 unit = 1 cm.
+   Truth: a column holds the pelvis; an aluminium spine frame inside the chest carries the battery, the computer and the
+   shoulder actuators. Each shoulder is three actuators in a row (pitch, roll, then yaw along the upper arm) whose axes
+   meet at one point, so it works like a ball joint; the elbow is a fourth. The neck pans and tilts a head with two
+   cameras a few centimetres apart (depth from disparity). Every joint is a compact actuator: motor, gear, encoder,
+   current sensing, so the arm can limit its force near people.
+   Four joints to place a hand at a point (3 numbers) leaves one spare: the elbow can swing round a circle while the hand
+   stays still. That is redundancy.
+   Parts: stand | spine, battery, pc | torso | shP, shR | shY, upper | elbow, fore, hand | neckP, neckT | head, cams | harness | ball
+   ============================================================ */
+const HU = { C: 30, SZ: 70, SY: 15.5, L1: 20, L2: 18, H: 7, NZ: 77, VMAX: 120 };
+const HU_LIM = [[-60, 175], [-60, 130], [-95, 95], [0, 145]];
+const HU_JN = ['Shoulder pitch', 'Shoulder roll', 'Shoulder yaw', 'Elbow'];
+const HU_REST = [10, 8, 0, 25];
+const HU_BALL0 = [56, 26, 62];
+
+const huS = s => [HU.C, HU.C + s*HU.SY, HU.SZ];
+function huFK(q, s){ const T1 = tMul(tTr(...huS(s)), tRy(-q[0]*DEG)), T2 = tMul(T1, tRx(s*q[1]*DEG)), T3 = tMul(T2, tRy(90*DEG)), T4 = tMul(T3, tRx(s*q[2]*DEG));
+  const T5 = tCat(T4, tTr(HU.L1, 0, 0), tRy(-q[3]*DEG));
+  return { T1, T2, T3, T4, T5, E: tAp(T5, [0,0,0]), W: tAp(T5, [HU.L2, 0, 0]), tip: tAp(T5, [HU.L2 + HU.H, 0, 0]) }; }
+// hand (tip) at w, elbow swung phi degrees round the shoulder-hand line (0 = lowest); returns joint angles
+function huIK(w, s, phi, prevYaw = 0){
+  const S = huS(s), d0 = sub(w, S), d = vLen(d0), L2 = HU.L2 + HU.H;
+  if (d > HU.L1 + L2 - .2) return { err: 'Out of reach: the arm is straight' }; if (d < 8) return { err: 'Too close to the shoulder' };
+  const u = vSc(d0, 1/d), down = [0, 0, -1], n1r = sub(down, vSc(u, dot(down, u))), n1 = vLen(n1r) > 1e-3 ? norm(n1r) : norm(cross(u, [1, 0, 0])), n2 = vSc(cross(u, n1), s);
+  const ca = (HU.L1**2 + d*d - L2**2) / (2*HU.L1*d), al = Math.acos(clamp(ca, -1, 1)), ph = phi*DEG;
+  const E = vAdd(vAdd(S, vSc(u, HU.L1*Math.cos(al))), vSc(vAdd(vSc(n1, Math.cos(ph)), vSc(n2, Math.sin(ph))), HU.L1*Math.sin(al)));
+  const a = vSc(sub(E, S), 1/HU.L1), b = norm(sub(w, E));
+  const r = Math.asin(clamp(a[1], -1, 1))*s/DEG, p = Math.atan2(a[0], -a[2])/DEG;
+  const e = Math.acos(clamp(dot(a, b), -1, 1))/DEG;
+  const T3 = huFK([p, r, 0, 0], s).T3, x3 = tAx(T3, 0), y3 = tAx(T3, 1), z3 = tAx(T3, 2), v = sub(b, vSc(x3, dot(b, x3)));
+  const yaw = vLen(v) < 1e-4 ? prevYaw : s*Math.atan2(-dot(v, y3), dot(v, z3))/DEG;
+  const q = [p, r, yaw, e];
+  for (let i = 0; i < 4; i++) if (q[i] < HU_LIM[i][0] || q[i] > HU_LIM[i][1]) return { err: `${s > 0 ? 'Left' : 'Right'} ${HU_JN[i].toLowerCase()} would pass its limit`, q };
+  return { q }; }
+// hands and elbows must stay out of the torso, the head and each other's way
+function huSelf(qL, qR){ const pts = [];
+  for (const [q, s] of [[qL, 1], [qR, -1]]){ const F = huFK(q, s); for (const k of [.5, 1]) pts.push(vLerp(F.E, F.tip, k)); pts.push(F.E); }
+  for (const p of pts){ const x = p[0] - HU.C, y = p[1] - HU.C;
+    if (Math.abs(x) < 9.5 && Math.abs(y) < 11.5 && p[2] > 40 && p[2] < 75) return { why: 'Self-collision: a hand hit the torso', at: p };
+    if (Math.hypot(x, y) < 7.5 && p[2] > 76 && p[2] < 93) return { why: 'Self-collision: a hand hit the head', at: p }; }
+  const a = huFK(qL, 1).tip, b = huFK(qR, -1).tip; if (vLen(sub(a, b)) < 4) return { why: 'The hands collided', at: vLerp(a, b, .5) };
+  return null; }
+
+function huArm(st, q, s, m){ const F = huFK(q, s), side = v => s*v;
+  sbPart('shP'); qCyl(T_I, 'y', [HU.C, HU.SZ], HU.C + side(11.4), HU.C + side(15.6), 3.6, MOTOR, { w: 1.1, sh: tone });
+  sbPart('shR'); qCyl(F.T1, 'x', [s*HU.SY*0, 0], -3.2, 3.2, 3.1, MOTOR, { w: 1, sh: tone });
+  for (const x of [-3.2, 2.6]) qBox(F.T1, [x, Math.min(side(-1), side(2.6)), -2], [x + .6, Math.max(side(-1), side(2.6)), 2], m, { w: .7, sh: tone });
+  sbPart('shY'); qCyl(F.T4, 'x', [0, 0], 3, 8, 2.6, MOTOR, { w: 1, sh: tone });
+  sbPart('upper'); qExt(F.T4, ellUV(0, 0, 2.6, 2.6, 14), 8, HU.L1 - 2.6, m, { w: 1.5 });
+  sbPart('elbow'); qCyl(F.T4, 'y', [HU.L1, 0], -2.4, 2.4, 2.6, MOTOR, { w: 1, sh: tone });
+  sbPart('fore'); qExt(F.T5, ellUV(0, 0, 2.2, 2.2, 14), 2.4, HU.L2, m, { w: 1.4 });
+  sbPart('hand'); const Tw = tMul(F.T5, tTr(HU.L2, 0, 0)); qBox(Tw, [0, -2.2, -1], [4, 2.2, 1], CERAMIC, { w: .9, sh: tone });
+  for (let k = 0; k < 4; k++){ const y = -1.65 + k*1.1; qBox(Tw, [4, y - .4, -.7], [HU.H - (k === 0 || k === 3 ? .8 : 0), y + .4, .7], CERAMIC, { w: .6, sh: tone }); }
+  qBox(Tw, [1, s > 0 ? 2.2 : -3.2, -.6], [3.8, s > 0 ? 3.2 : -2.2, .6], CERAMIC, { w: .6, sh: tone });
+  sbPart('harness'); qWire([[HU.C - 3, HU.C + side(10), 68], tAp(F.T1, [0, side(2), 3.4]), tAp(F.T4, [5, 0, s*2.8]), tAp(F.T4, [HU.L1 - 3, 0, s*2.8])], '#3a3633', .3, { seg: 4 });
+  return F; }
+
+function huDraw(st, m){
+  const C = HU.C;
+  // ---- stand: base, column, pelvis
+  sbPart('stand'); qRod([C, C, 3], [C, C, 4.6], 14, STEEL, { w: 1.4 }); qRod([C, C, 4.6], [C, C, 40], 2.6, ALU, { w: 1.2 }); qBox(T_I, [C - 6, C - 8, 40], [C + 6, C + 8, 46], DARK, { w: 1.1 });
+  // ---- chest: spine frame, battery, computer, shoulder actuators inside the torso cover
+  sbGroup('torso', T_I, [C - 9, C - 12, 46], [C + 9, C + 12, 74]);
+  sbPart('spine'); for (const y of [-4, 4]) qBox(T_I, [C - 6, C + y - .6, 46], [C - 4.8, C + y + .6, 73], ALU, { w: .8 }); qBox(T_I, [C - 6, C - 11, 68], [C - 2, C + 11, 70.4], ALU, { w: .8 });
+  sbPart('battery'); qBox(T_I, [C - 4.6, C - 6, 47], [C + 4, C + 6, 54], BATT, { w: .9, deco: n => n[0] === 1 ? txT(T_I, [C + 4.02, C, 50.5], [0,1,0], [0,0,1], '48V', 1.6, '#fff') : '' });
+  sbPart('pc'); qBox(T_I, [C - 4.6, C - 7, 56], [C + 2, C + 7, 62], DARK, { w: .9 }); qBox(T_I, [C + 2, C - 5, 57], [C + 3.2, C + 5, 61], ALU, { w: .6, deco: n => n[0] === 1 ? [-3.6, -1.2, 1.2, 3.6].map(y => line([[C + 3.22, C + y, 57.5], [C + 3.22, C + y, 60.5]], .45)).join('') : '' });
+  sbPart('harness'); qWire([[C + 1, C - 2, 54], [C + 2, C - 3, 56.5], [C + 1, C - 3, 61]], CABLE.pwr, .35); qWire([[C - 1, C + 3, 62], [C - 3, C + 6, 66], [C - 3, C + 10, 69]], CABLE.sig, .3);
+  sbPart('torso'); qExt(T_I, rrUV(C - 9, C - 12, C + 9, C + 12, 5), 46, 74, m, { ax: 'z', cover: true, w: 2.2, capDeco: b => b ? '' : '' });
+  sbFree(); if (facing([1, 0, 0])) sbPut(txT(T_I, [C + 9.05, C, 66], [0,1,0], [0,0,1], 'HU-10', 2.6) + dotAt([C + 9.1, C, 62], .7, st.mode === 'op' ? '#43c25c' : '#8d877a'), obbW([C + 9, C - 5, 61], [C + 9.1, C + 5, 68]), { p: 'torso' });
+  // ---- arms
+  const FL = huArm(st, st.qL, 1, m), FR = huArm(st, st.qR, -1, m);
+  // ---- neck and head
+  sbFree(); sbPart('neckP'); qRod([C - 1, C, 74], [C - 1, C, 77], 3, MOTOR, { w: 1, sh: tone });
+  const Tn = tMul(tTr(C - 1, C, HU.NZ), tRz(st.neck[0]*DEG)), Th = tMul(Tn, tRy(st.neck[1]*DEG));
+  sbPart('neckT'); qCyl(Tn, 'y', [0, 1.4], -2.4, 2.4, 2, MOTOR, { w: 1, sh: tone });
+  sbPart('head'); qExt(Th, rrUV(-6, -6.5, 6.5, 6.5, 3), 3, 15, m, { ax: 'z', w: 1.8, sh: tone });
+  qBox(Th, [6.5, -5.4, 7], [7.1, 5.4, 12.6], DARK, { w: 1, sh: tone });
+  sbPart('cams'); for (const y of [-2.8, 2.8]) qCyl(Th, 'x', [y, 10], 7.1, 7.9, 1.2, STEEL, { w: .8, deco: () => vis(tAx(Th, 0)) ? dotAt(tAp(Th, [7.92, y, 10]), .7, '#3a3633', .3) : '' });
+  // ---- target ball
+  sbPart('ball'); qBall(st.ball, 2.4, matOf('#f4b829'), { w: 1.2 });
+  const pt = boardTop(0, 0, 60, 60, 3, 6); let over = '', floor = '';
+  if (st.mode === 'op'){ const eye = tAp(Th, [7.9, 0, 10]), q0 = P(...eye), q1 = P(...st.ball);
+    over += `<path d="M${f(q0[0])} ${f(q0[1])}L${f(q1[0])} ${f(q1[1])}" stroke="#5a82c6" stroke-width=".8" stroke-dasharray="1.4 1.2" opacity=".75" pointer-events="none"/>`;
+    if (st.trace) over += trailSVG(st.trailR, '#e2483d', .9) + trailSVG(st.trailL, '#3d5878', .9);
+    // the swivel circle: every elbow position that keeps the hand where it is
+    for (const [s, on] of [[1, st.mode2 !== 'right'], [-1, st.mode2 !== 'left']]){ if (!on || st.mode2 === 'wave') continue; const F = s > 0 ? FL : FR, Sh = huS(s), d0 = sub(F.tip, Sh), d = vLen(d0), u = vSc(d0, 1/d), L2 = HU.L2 + HU.H;
+      const ca = (HU.L1**2 + d*d - L2**2) / (2*HU.L1*d); if (Math.abs(ca) > 1) continue; const al = Math.acos(ca), c = vAdd(Sh, vSc(u, HU.L1*Math.cos(al))), rr = HU.L1*Math.sin(al);
+      const n1 = norm(sub([0, 0, -1], vSc(u, -u[2]))), n2 = cross(u, n1), ring = [];
+      for (let k = 0; k <= 36; k++){ const a = k/36*2*Math.PI; ring.push(vAdd(c, vAdd(vSc(n1, rr*Math.cos(a)), vSc(n2, rr*Math.sin(a))))); }
+      over += trailSVG(ring, '#c76a12', .7, '1.2 1.2'); }
+    over += tipHandle(st.ball, 3, !!st.crash); if (st.crash) over += crashBurst(st.crash.at, st.crash.t); }
+  return { under: board(0, 0, 60, 60, 3, 6), z0: 3, clip: pt, floor, over };
+}
+
+function huTargets(st, lab){
+  const b = st.ball, md = st.mode2;
+  if (md === 'wave'){ const t = st.t; st.qtR = [35, 85, 20*Math.sin(t*5), 95 + 15*Math.sin(t*5)]; st.qtL = HU_REST.slice(); return; }
+  const want = { left: md === 'left' || md === 'both', right: md === 'right' || md === 'both' };
+  for (const [s, key, on] of [[1, 'L', want.left], [-1, 'R', want.right]]){ const tk = 'qt' + key;
+    if (!on){ st[tk] = HU_REST.slice(); continue; }
+    const w = md === 'both' ? vAdd(b, [0, s*3, 0]) : b, r = huIK(w, s, st.swivel[key], st[tk][2]);
+    if (r.err){ st.reachErr[key] = r.err; continue; } st.reachErr[key] = null; st[tk] = r.q; } }
+function huTick(st, dt, ui, lab){
+  st.t += dt; huTargets(st, lab);
+  let moving = false; const vmax = HU.VMAX*st.speed, step = (q, qt) => q.map((v, i) => { const d = qt[i] - v; if (Math.abs(d) < 1e-4) return v; moving = true; return v + Math.sign(d)*Math.min(Math.abs(d), vmax*dt); });
+  const nL = step(st.qL, st.qtL), nR = step(st.qR, st.qtR), c = huSelf(nL, nR);
+  if (c){ if (!st.crash){ st.crashes++; lab.flash(c.why + ' — stopped short'); } st.crash = { at: c.at, t: 1 }; st.qtL = st.qL.slice(); st.qtR = st.qR.slice(); }
+  else { const pL = huFK(st.qL, 1).tip, pR = huFK(st.qR, -1).tip; st.qL = nL; st.qR = nR; const tL = huFK(nL, 1).tip, tR = huFK(nR, -1).tip;
+    st.hv = Math.max(vLen(sub(tL, pL)), vLen(sub(tR, pR)))/Math.max(dt, 1e-3);
+    for (const [arr, p] of [[st.trailL, tL], [st.trailR, tR]]){ const l = arr[arr.length - 1]; if (!l || vLen(sub(l, p)) > .5){ arr.push(p); if (arr.length > 200) arr.shift(); } } }
+  if (!moving) st.hv = 0;
+  // neck: pan and tilt toward the ball
+  const N = [HU.C - 1, HU.C, HU.NZ + 10], d = sub(st.ball, N), pan = clamp(Math.atan2(d[1], d[0])/DEG, -80, 80), tilt = clamp(Math.atan2(-d[2], Math.hypot(d[0], d[1]))/DEG, -40, 50);
+  const nn = [pan, tilt]; st.neck = st.neck.map((v, i) => { const e = nn[i] - v; if (Math.abs(e) > 1e-3) moving = true; return v + clamp(e, -150*dt, 150*dt); });
+  st.gaze = Math.hypot(pan - st.neck[0], tilt - st.neck[1]);
+  if (st.crash){ st.crash.t -= dt/1.2; if (st.crash.t <= 0) st.crash = null; else moving = true; }
+  return moving || st.dragging || st.mode2 === 'wave' || !!st.crash;
+}
+
+ROBOTS.humanoid = {
+  id: 'humanoid', fig: '10', name: 'Humanoid upper body', pal: 'cobalt', kicker: '2 × 4-DOF arms · 2-DOF neck · stereo cameras',
+  blurb: 'A torso on a stand with two human-proportioned arms and a camera head. Drag the ball: the head follows it and the hands reach for it, and the spare degree of freedom lets you swing each elbow without moving the hand.',
+  size: [60, 60, 96], center: [30, 30], bounds: [4, 56, 4, 56, 0, 94],
+  init: () => ({ qL: HU_REST.slice(), qR: HU_REST.slice(), qtL: HU_REST.slice(), qtR: HU_REST.slice(), neck: [0, 0], ball: HU_BALL0.slice(), swivel: { L: 20, R: 20 }, mode2: 'right', speed: .6,
+    reachErr: { L: null, R: null }, t: 0, hv: 0, gaze: 0, trailL: [], trailR: [], trace: false, crash: null, crashes: 0 }),
+  thumbState: { qR: [70, 20, -20, 60], qL: [20, 15, 0, 40], neck: [-10, 10] }, thumbYaw: 0,
+  steps: [
+    { title: 'Stand & pelvis', parts: ['stand'], text: 'A weighted base and a column hold the pelvis at table height. No legs: this robot is about arms, hands and eyes.' },
+    { title: 'Spine, battery & computer', parts: ['spine', 'battery', 'pc'], peek: true, text: 'An aluminium spine frame runs up the chest with a cross-bar for the shoulders. The battery sits low, the computer above it runs vision and control.' },
+    { title: 'Chest cover', parts: ['torso'], text: 'A shell over the spine. See-through keeps the inside in view.' },
+    { title: 'Shoulder pitch & roll actuators', parts: ['shP', 'shR'], text: 'Pitch swings the arm forward and back; roll, mounted on the pitch output, lifts it sideways. Their axes cross at the shoulder centre.' },
+    { title: 'Shoulder yaw & upper arms', parts: ['shY', 'upper'], text: 'The third shoulder actuator twists the upper arm about its own length. Three axes through one point: a motorised ball joint.' },
+    { title: 'Elbows, forearms & hands', parts: ['elbow', 'fore', 'hand'], text: 'The elbow is the fourth joint. The hands here are passive: fixed fingers, no motors.' },
+    { title: 'Neck pan & tilt', parts: ['neckP', 'neckT'], text: 'Two small actuators let the head look left and right, up and down.' },
+    { title: 'Head & stereo cameras', parts: ['head', 'cams'], text: 'Two cameras 56 mm apart, like eyes. The same point lands in a slightly different place in each image; that shift (disparity) gives its distance.' },
+    { title: 'Harness', parts: ['harness'], text: 'Power and a data bus down each arm, actuator to actuator.' },
+    { title: 'Target ball', parts: ['ball'], text: 'Something to look at and reach for. In Operate, drag it around.' },
+  ],
+  parts: {
+    stand: { name: 'Stand & pelvis', kind: 'structure', lbl: 'STAND', key: true, short: 'base + column', info: 'Heavy base so a fast arm swing cannot tip it.', held: 'The table' },
+    spine: { name: 'Spine frame', kind: 'structure', lbl: 'SPINE', inside: true, short: 'aluminium frame', info: 'Carries all the arm loads down to the pelvis.', held: 'The pelvis' },
+    battery: { name: 'Battery', kind: 'power', lbl: 'BATTERY', inside: true, short: '48 V', info: 'Low in the chest for a low centre of mass.', held: 'The spine' },
+    pc: { name: 'Computer', kind: 'electronics', lbl: 'COMPUTER', inside: true, short: 'vision + control', info: 'Finds the ball in both camera images, computes its 3D position, solves both arms’ IK and runs the joint loops.', held: 'The spine' },
+    torso: { name: 'Chest cover', kind: 'cover', lbl: 'TORSO', key: true, short: 'shell', info: 'Rounded, padded edges: a humanoid is meant to work next to people.', held: 'Clips on the spine' },
+    shP: { name: 'Shoulder pitch actuators', kind: 'motor', lbl: 'SHOULDER PITCH', short: 'axis across the chest', info: 'The strongest joints: they carry the whole arm’s weight.', held: 'The shoulder cross-bar' },
+    shR: { name: 'Shoulder roll actuators', kind: 'motor', lbl: 'SHOULDER ROLL', short: 'axis forward', info: 'Lifts the arm sideways (abduction).', held: 'The pitch outputs' },
+    shY: { name: 'Shoulder yaw actuators', kind: 'motor', lbl: 'SHOULDER YAW', short: 'axis along the upper arm', info: 'Twists the upper arm: this is what swings the elbow round when you change the swivel.', held: 'The roll outputs' },
+    upper: { name: 'Upper arms', kind: 'structure', lbl: 'UPPER ARM', key: true, short: '200 mm', info: 'Human proportions: upper arm a bit longer than forearm.', held: 'The yaw actuators', spec: 'L1 = 200 mm' },
+    elbow: { name: 'Elbow actuators', kind: 'motor', lbl: 'ELBOW', short: '0–145°', info: 'The elbow angle alone sets how far the hand is from the shoulder.', held: 'The ends of the upper arms' },
+    fore: { name: 'Forearms', kind: 'structure', lbl: 'FOREARM', short: '180 mm', info: 'Light: weight far out costs shoulder torque.', held: 'The elbow actuators', spec: 'L2 = 180 mm' },
+    hand: { name: 'Hands', kind: 'tool', lbl: 'HAND', key: true, short: 'passive', info: 'Fixed fingers. A real humanoid hand has 6 to 20 more actuators.', held: 'The forearm ends' },
+    neckP: { name: 'Neck pan actuator', kind: 'motor', short: 'look left / right', info: '±80 degrees.', held: 'The top of the chest' },
+    neckT: { name: 'Neck tilt actuator', kind: 'motor', short: 'look up / down', info: '−40 to +50 degrees.', held: 'The pan output' },
+    head: { name: 'Head', kind: 'cover', lbl: 'HEAD', key: true, short: 'camera housing', info: 'The dashed blue line shows where it is looking.', held: 'The tilt actuator' },
+    cams: { name: 'Stereo cameras', kind: 'sensor', lbl: 'STEREO CAMERAS', short: '56 mm baseline', info: 'Depth = focal length × baseline / disparity. Close objects shift a lot between the two images, far ones hardly at all.', held: 'The face plate' },
+    harness: { name: 'Harness', kind: 'wiring', short: 'power + bus', info: 'Runs down each arm past every actuator.', held: 'Clips' },
+    ball: { shadow: 'ball', name: 'Target ball', kind: 'tool', short: 'drag it', info: 'Drag the yellow ring to move it.', held: 'Your mouse' },
+  },
+  concepts: [
+    ['Redundancy', 'A point in space is 3 numbers; each arm has 4 joints. The spare one shows as the orange dashed circle: every elbow position on it keeps the hand on the ball. Move the swivel slider and the elbow slides round the circle while the hand stays put.'],
+    ['Why use the spare joint?', 'To keep elbows tucked in near people, to stay away from joint limits, or to reach round an obstacle. Humans do it all the time: try holding your hand still and moving your elbow.'],
+    ['Reachability', 'Reach = 20 + 25 cm from each shoulder. The ball near the chest is hard to reach (elbow folds fully); far out the arm goes straight and the IK has a single answer.'],
+    ['Gaze control', 'Pan and tilt follow the ball so it stays in the middle of both camera images, where stereo depth is most accurate.'],
+    ['Safe motion near people', 'Collaborative robots limit hand speed and force near humans: 250 mm/s is a common slow-speed limit. The speed slider scales every joint; the readout turns red above the limit.'],
+  ],
+  draw: huDraw,
+  active: st => { const a = {}; const d = (q, qt) => q.some((v, i) => Math.abs(v - qt[i]) > .3); if (d(st.qL, st.qtL) || d(st.qR, st.qtR)) a.shP = a.shR = a.shY = a.elbow = true; if (st.gaze > .5) a.neckP = a.neckT = true; return a; },
+  enterOp: st => { st.t = 0; },
+  opHTML: () => `<div class="seg" id="humode">${[['right', 'Right hand'], ['left', 'Left hand'], ['both', 'Both'], ['wave', 'Wave']].map(([k, l]) => `<button data-m="${k}">${l}</button>`).join('')}</div>
+    <p class="note">Drag the yellow ring to move the ball. The head tracks it; the chosen hand reaches for it.</p>
+    ${slHTML('husl', 'Left elbow swivel', -90, 90, 1, '°', 'Redundancy: elbow round the circle')}${slHTML('husr', 'Right elbow swivel', -90, 90, 1, '°')}
+    ${slHTML('husp', 'Speed limit', 10, 100, 5, '%')}
+    <div class="row2"><button id="hureset">Reset ball</button><button id="hutr">Trace</button><button id="huclr">Clear trace</button></div>`,
+  opBind(el, st, ui, lab){ const $ = id => document.getElementById(id);
+    el.querySelectorAll('#humode button').forEach(b => b.onclick = () => { st.mode2 = b.dataset.m; st.t = 0; lab.kick(); ui.render(); });
+    $('s_husl').oninput = e => { st.swivel.L = +e.target.value; lab.kick(); }; $('s_husr').oninput = e => { st.swivel.R = +e.target.value; lab.kick(); };
+    $('s_husp').oninput = e => { st.speed = +e.target.value/100; ui.render(); };
+    $('hureset').onclick = () => { st.ball = HU_BALL0.slice(); lab.kick(); };
+    $('hutr').onclick = () => { st.trace = !st.trace; ui.render(); }; $('huclr').onclick = () => { st.trailL = []; st.trailR = []; ui.render(); }; },
+  opSync(el, st){ const $ = id => document.getElementById(id);
+    el.querySelectorAll('#humode button').forEach(b => b.setAttribute('aria-pressed', b.dataset.m === st.mode2));
+    slSync('husl', st.swivel.L, `${st.swivel.L}°`); slSync('husr', st.swivel.R, `${st.swivel.R}°`); slSync('husp', Math.round(st.speed*100), Math.round(st.speed*100) + '%');
+    $('hutr').setAttribute('aria-pressed', st.trace); },
+  readout(st){ const rows = [], fmt = q => q.map(v => v.toFixed(0)).join(' ') + '°';
+    rows.push({ k: 'Right arm', v: fmt(st.qR), tip: 'Pitch / roll / yaw / elbow, degrees' }); rows.push({ k: 'Left arm', v: fmt(st.qL), tip: 'Pitch / roll / yaw / elbow, degrees' });
+    for (const [key, s] of [['R', -1], ['L', 1]]){ const F = huFK(st['q' + key], s), dist = vLen(sub(F.tip, st.ball)), on = st.mode2 === 'both' || st.mode2 === (s > 0 ? 'left' : 'right');
+      if (on) rows.push({ k: `${s > 0 ? 'Left' : 'Right'} hand to ball`, bar: Math.min(1, dist/40), v: st.reachErr[key] ? 'can’t reach' : `${(Math.max(0, dist - (st.mode2 === 'both' ? 3 : 0))*10).toFixed(0)} mm`, warn: !!st.reachErr[key], tip: st.reachErr[key] || '' }); }
+    const dS = Math.min(vLen(sub(st.ball, huS(1))), vLen(sub(st.ball, huS(-1))));
+    rows.push({ k: 'Ball to shoulder', bar: dS/(HU.L1 + HU.L2 + HU.H), v: `${(dS*10).toFixed(0)} mm`, warn: dS > HU.L1 + HU.L2 + HU.H - .2, tip: 'Reach: 450 mm' });
+    rows.push({ k: 'Neck pan, tilt', v: `${st.neck[0].toFixed(0)}° ${st.neck[1].toFixed(0)}°` });
+    rows.push({ k: 'Gaze error', bar: st.gaze/30, v: `${st.gaze.toFixed(1)}°` });
+    rows.push({ k: 'Hand speed', bar: st.hv*10/500, v: `${(st.hv*10).toFixed(0)} mm/s`, warn: st.hv*10 > 250, tip: 'Collaborative limit ~250 mm/s' });
+    rows.push({ k: 'Self-collisions', v: `${st.crashes}`, warn: !!st.crash });
+    return rows; },
+  stats: st => [{ label: 'Ball X Y Z mm', value: `${Math.round((st.ball[0]-HU.C)*10)} ${Math.round((st.ball[1]-HU.C)*10)} ${Math.round((st.ball[2]-3)*10)}`, small: true }],
+  tick: huTick,
+  onDrag(st, dx, dy, phase, lab){ if (phase === 'start'){ st.dragP = st.ball.slice(); return; } if (phase !== 'move') return;
+    const p = vAdd(st.dragP, dragWorld(dx, dy)); p[0] = clamp(p[0], 4, 58); p[1] = clamp(p[1], 2, 58); p[2] = clamp(p[2], 6, 100);
+    if (Math.abs(p[0] - HU.C) < 11 && Math.abs(p[1] - HU.C) < 14 && p[2] < 96) return; st.dragP = p; st.ball = p.slice(); },
+  params(st, q){ if (q.has('ball')) st.ball = q.get('ball').split(',').map(Number); if (q.has('hm')) st.mode2 = q.get('hm');
+    if (q.has('sw')){ const v = +q.get('sw'); st.swivel = { L: v, R: v }; }
+    if (q.get('settle') === '1'){ for (let k = 0; k < 400; k++) huTick(st, 1/60, null, { flash(){} }); } },
+};
+ROBOT_ORDER.push({ id: 'humanoid', name: 'Humanoid upper body', blurb: 'Two 4-DOF arms, a 2-DOF neck and a stereo camera head on a torso. The head tracks the ball, the hands reach for it, and the spare joint swings the elbow.', chips: ['10 DOF', 'Redundant', 'Vision'] });
+
 (() => { const q = new URLSearchParams(location.search), R = ROBOTS[q.get('robot')];
   if (R) mountLab(R); else renderHub(); })();
 

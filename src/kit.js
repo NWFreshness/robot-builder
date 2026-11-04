@@ -21,6 +21,8 @@ const vAdd = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]], vSc = (a, k) => [a[0]*
 const vLen = a => Math.hypot(a[0], a[1], a[2]), vLerp = (a, b, t) => [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t];
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const wrap180 = a => ((a + 540) % 360) - 180;
+// frame with origin o, x axis along X and y axis as close to Y as possible (z = x cross y)
+function tFrame(o, X, Y){ const x = norm(X), z = norm(cross(x, Y)), y = cross(z, x); return [x[0], y[0], z[0], o[0], x[1], y[1], z[1], o[1], x[2], y[2], z[2], o[2]]; }
 
 /* ---------- oriented boxes ---------- */
 function obbT(T, lo, hi){ const m = [0,1,2].map(i => (lo[i] + hi[i]) / 2);
